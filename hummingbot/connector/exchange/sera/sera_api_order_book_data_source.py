@@ -32,3 +32,9 @@ class SeraAPIOrderBookDataSource(OrderBookTrackerDataSource):
             },
             timestamp=timestamp,
         )
+
+    async def subscribe_to_trading_pair(self, trading_pair: str):
+        pass
+
+    async def unsubscribe_from_trading_pair(self, trading_pair: str):
+        pass

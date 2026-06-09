@@ -14,11 +14,12 @@ from hummingbot.connector.exchange.sera.sera_auth import SeraAuth
 from hummingbot.connector.exchange_py_base import ExchangePyBase
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.connector.utils import combine_to_hb_trading_pair, split_hb_trading_pair
-from hummingbot.core.data_type.common import OrderType, TradeType
+from hummingbot.core.data_type.common import OrderType, PriceType, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, OrderUpdate, TradeUpdate
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
 from hummingbot.core.data_type.trade_fee import TokenAmount, TradeFeeBase
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
+from hummingbot.core.rate_oracle.rate_oracle import RateOracle
 from hummingbot.core.utils.async_utils import safe_ensure_future, safe_gather
 from hummingbot.core.utils.estimate_fee import build_trade_fee
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
@@ -34,7 +35,7 @@ class SeraExchange(ExchangePyBase):
             sera_api_key: str,
             sera_api_secret: str,
             sera_wallet_address: str,
-            sera_private_key: str,
+            sera_wallet_private_key: str,
             balance_asset_limit: Optional[Dict[str, Dict[str, Decimal]]] = None,
             rate_limits_share_pct: Decimal = Decimal("100"),
             trading_pairs: Optional[List[str]] = None,
@@ -44,7 +45,7 @@ class SeraExchange(ExchangePyBase):
         self.api_key = sera_api_key
         self.api_secret = sera_api_secret
         self.wallet_address = sera_wallet_address.lower() if sera_wallet_address else None
-        self.private_key = sera_private_key
+        self.private_key = sera_wallet_private_key
         self._domain = domain
         self._trading_required = trading_required
         self._trading_pairs = trading_pairs or []
@@ -53,6 +54,9 @@ class SeraExchange(ExchangePyBase):
         self._order_uuid_ints: Dict[str, str] = {}
         self._executor_id: Optional[int] = None
         self._eip712_domain: Optional[Dict[str, Any]] = None
+        self._manual_mid_price: Dict[str, Decimal] = {}
+        self._last_oracle_mid_price_log: Dict[str, float] = {}
+        self._last_status_log_timestamp: float = 0
         super().__init__(balance_asset_limit, rate_limits_share_pct)
 
     @property
@@ -112,7 +116,92 @@ class SeraExchange(ExchangePyBase):
     def status_dict(self) -> Dict[str, bool]:
         status = super().status_dict
         status["user_stream_initialized"] = True
+        if not all(status.values()):
+            now = time.time()
+            if now - self._last_status_log_timestamp >= 10:
+                self._last_status_log_timestamp = now
+                not_ready = [key for key, value in status.items() if not value]
+                self.logger().info(f"Sera connector is not ready; waiting for: {', '.join(not_ready)}.")
         return status
+
+    def set_manual_mid_price(self, trading_pair: str, price: Optional[Decimal]):
+        if price is None or (hasattr(price, "is_nan") and price.is_nan()):
+            self._manual_mid_price.pop(trading_pair, None)
+        else:
+            self._manual_mid_price[trading_pair] = Decimal(str(price))
+
+    def set_mid_price_from_price_oracle(self, trading_pair: str) -> Optional[Decimal]:
+        oracle_price = self._get_oracle_mid_price(trading_pair)
+        if oracle_price is not None:
+            self.set_manual_mid_price(trading_pair, oracle_price)
+        return oracle_price
+
+    def get_mid_price(self, trading_pair: str) -> Decimal:
+        if trading_pair in self._manual_mid_price:
+            return self._manual_mid_price[trading_pair]
+        order_book_mid_price = self._get_order_book_mid_price(trading_pair)
+        if self._is_invalid_price(order_book_mid_price):
+            oracle_price = self._get_oracle_mid_price(trading_pair)
+            self._log_oracle_mid_price_fallback(trading_pair, oracle_price)
+            return oracle_price or s_decimal_NaN
+        return order_book_mid_price
+
+    def get_price_by_type(self, trading_pair: str, price_type: PriceType) -> Decimal:
+        if price_type == PriceType.MidPrice:
+            return self.get_mid_price(trading_pair)
+        if price_type == PriceType.BestBid:
+            return self._get_order_book_top_price(trading_pair, False)
+        if price_type == PriceType.BestAsk:
+            return self._get_order_book_top_price(trading_pair, True)
+        price = super().get_price_by_type(trading_pair, price_type)
+        return price
+
+    @staticmethod
+    def _is_invalid_price(price: Decimal) -> bool:
+        return price is None or (hasattr(price, "is_nan") and price.is_nan()) or price <= Decimal("0")
+
+    def _get_order_book_mid_price(self, trading_pair: str) -> Decimal:
+        order_book = self.order_books.get(trading_pair)
+        if order_book is None:
+            return s_decimal_NaN
+        try:
+            best_ask = Decimal(str(order_book.get_price(True)))
+            best_bid = Decimal(str(order_book.get_price(False)))
+        except OSError:
+            return s_decimal_NaN
+        if self._is_invalid_price(best_ask) or self._is_invalid_price(best_bid):
+            return s_decimal_NaN
+        return (best_ask + best_bid) / Decimal("2")
+
+    def _get_order_book_top_price(self, trading_pair: str, is_buy: bool) -> Decimal:
+        order_book = self.order_books.get(trading_pair)
+        if order_book is None:
+            return s_decimal_NaN
+        try:
+            top_price = Decimal(str(order_book.get_price(is_buy)))
+        except OSError:
+            return s_decimal_NaN
+        if self._is_invalid_price(top_price):
+            return s_decimal_NaN
+        return self.quantize_order_price(trading_pair, top_price)
+
+    def _log_oracle_mid_price_fallback(self, trading_pair: str, oracle_price: Optional[Decimal]):
+        now = time.time()
+        last_log_timestamp = self._last_oracle_mid_price_log.get(trading_pair, 0)
+        if now - last_log_timestamp < 30:
+            return
+        self._last_oracle_mid_price_log[trading_pair] = now
+        if oracle_price is None:
+            self.logger().info(f"Order book is empty for {trading_pair}; oracle mid price is not available yet.")
+        else:
+            self.logger().info(f"Order book is empty for {trading_pair}; using oracle mid price {oracle_price}.")
+
+    @staticmethod
+    def _get_oracle_mid_price(trading_pair: str) -> Optional[Decimal]:
+        oracle_price = RateOracle.get_instance().get_pair_rate(trading_pair)
+        if oracle_price is not None and oracle_price > Decimal("0"):
+            return oracle_price
+        return None
 
     def supported_order_types(self):
         return [OrderType.LIMIT, OrderType.LIMIT_MAKER]

@@ -49,7 +49,7 @@ class SeraConfigMap(BaseConnectorConfigMap):
             "prompt_on_new": True,
         },
     )
-    sera_private_key: SecretStr = Field(
+    sera_wallet_private_key: SecretStr = Field(
         default=...,
         json_schema_extra={
             "prompt": "Enter your Sera wallet private key",

@@ -668,6 +668,46 @@ class DecibelPerpetualRateSourceMode(ExchangeRateSourceModeBase):
         )
 
 
+class WiseRateSourceMode(RateSourceModeBase):
+    name: str = Field(default="wise")
+    trading_pairs: str = Field(
+        default="",
+        description="Comma-delimited pairs to refresh from Wise in the rate oracle loop.",
+        json_schema_extra={
+            "prompt": lambda cm: "Wise pairs to refresh (comma-delimited, e.g. EURC-USDC,EUR-USD; empty for one-off rate command only)",
+            "prompt_on_new": True,
+            "is_connect_key": True,
+        },
+    )
+    currency_map: str = Field(
+        default="EURC:EUR,USDC:USD,USDT:USD,DAI:USD",
+        description="Comma-delimited Hummingbot token to ISO 4217 currency map for Wise.",
+        json_schema_extra={
+            "prompt": lambda cm: "Wise currency map (e.g. EURC:EUR,USDC:USD)",
+            "prompt_on_new": True,
+            "is_connect_key": True,
+        },
+    )
+    source_amount: Decimal = Field(
+        default=Decimal("100"),
+        description="Source amount used for Wise unauthenticated quote requests.",
+        gt=Decimal("0"),
+        json_schema_extra={
+            "prompt": lambda cm: "Wise quote source amount",
+            "prompt_on_new": True,
+            "is_connect_key": True,
+        },
+    )
+    model_config = ConfigDict(title="wise")
+
+    def build_rate_source(self) -> RateSourceBase:
+        return RATE_ORACLE_SOURCES[self.model_config["title"]](
+            trading_pairs=self.trading_pairs,
+            currency_map=self.currency_map,
+            source_amount=self.source_amount,
+        )
+
+
 class CoinbaseAdvancedTradeRateSourceMode(ExchangeRateSourceModeBase):
     name: str = Field(default="coinbase_advanced_trade")
     model_config = ConfigDict(title="coinbase_advanced_trade")
@@ -733,6 +773,7 @@ RATE_SOURCE_MODES = {
     DexalotRateSourceMode.model_config["title"]: DexalotRateSourceMode,
     EvedexPerpetualRateSourceMode.model_config["title"]: EvedexPerpetualRateSourceMode,
     DecibelPerpetualRateSourceMode.model_config["title"]: DecibelPerpetualRateSourceMode,
+    WiseRateSourceMode.model_config["title"]: WiseRateSourceMode,
     KuCoinRateSourceMode.model_config["title"]: KuCoinRateSourceMode,
     GateIoRateSourceMode.model_config["title"]: GateIoRateSourceMode,
     CoinbaseAdvancedTradeRateSourceMode.model_config["title"]: CoinbaseAdvancedTradeRateSourceMode,

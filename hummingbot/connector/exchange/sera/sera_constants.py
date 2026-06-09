@@ -61,6 +61,7 @@ CANCEL_ORDER_TYPES = {
 
 ONE_SECOND = 1
 ONE_MINUTE = 60
+FIVE_MINUTES = 5 * ONE_MINUTE
 MAX_REQUESTS_PER_MINUTE = 600
 READ_REQUESTS_PER_SECOND = 10
 
@@ -123,8 +124,14 @@ RATE_LIMITS = [
     RateLimit(
         limit_id=CANCEL_ORDER_PATH_URL,
         limit=READ_REQUESTS_PER_SECOND,
-        time_interval=ONE_SECOND,
+        time_interval=FIVE_MINUTES,
         linked_limits=[LinkedLimitWeightPair(TRADING_REQUEST_WEIGHT, 1)],
+    ),
+    RateLimit(
+        limit_id=ORDER_PATH_URL,
+        limit=READ_REQUESTS_PER_SECOND,
+        time_interval=ONE_SECOND,
+        linked_limits=[LinkedLimitWeightPair(READ_REQUEST_WEIGHT, 1)],
     ),
     RateLimit(
         limit_id=BALANCES_PATH_URL,

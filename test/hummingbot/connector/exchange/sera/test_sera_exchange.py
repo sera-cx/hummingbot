@@ -1,10 +1,14 @@
 import asyncio
+import json
+import re
 import unittest
 from decimal import Decimal
 from typing import Awaitable, Dict, List
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
-from hummingbot.connector.exchange.sera import sera_constants as CONSTANTS
+from aioresponses import aioresponses
+
+from hummingbot.connector.exchange.sera import sera_constants as CONSTANTS, sera_web_utils as web_utils
 from hummingbot.connector.exchange.sera.sera_auth import SeraAuth
 from hummingbot.connector.exchange.sera.sera_exchange import SeraExchange
 from hummingbot.core.data_type.common import OrderType, TradeType
@@ -30,7 +34,7 @@ class SeraExchangeTests(unittest.TestCase):
             sera_api_key="apiKey",
             sera_api_secret="apiSecret",
             sera_wallet_address=self.wallet_address,
-            sera_private_key=self.private_key,
+            sera_wallet_private_key=self.private_key,
             trading_pairs=[self.trading_pair],
         )
         self.exchange._set_current_timestamp(1234567890)
@@ -41,8 +45,6 @@ class SeraExchangeTests(unittest.TestCase):
             self.base_asset: {"symbol": self.base_asset, "currency": "EUR"},
             self.quote_asset: {"symbol": self.quote_asset, "currency": "USD"},
         }
-        self.exchange._api_get = AsyncMock()
-        self.exchange._api_post = AsyncMock()
 
     def tearDown(self) -> None:
         self.exchange.order_book_tracker.stop()
@@ -108,8 +110,9 @@ class SeraExchangeTests(unittest.TestCase):
             uuid_int,
         )
 
+    @aioresponses()
     @patch.object(SeraAuth, "sign_typed_data", return_value="0xsigned")
-    def test_place_order_previews_signs_and_submits_normalized_payload(self, sign_mock):
+    def test_place_order_previews_signs_and_submits_normalized_payload(self, mock_api, sign_mock):
         preview_response = {
             "normalized_amount": "1000",
             "normalized_price": "1.085",
@@ -127,7 +130,10 @@ class SeraExchangeTests(unittest.TestCase):
             },
             "eip712_types": CONSTANTS.ORDER_TYPES,
         }
-        self.exchange._api_post.side_effect = [preview_response, {"order_id": self.order_id}]
+        preview_url = web_utils.public_rest_url(CONSTANTS.PREVIEW_ORDER_PATH_URL)
+        order_url = web_utils.public_rest_url(CONSTANTS.ORDERS_PATH_URL)
+        mock_api.post(preview_url, body=json.dumps(preview_response))
+        mock_api.post(order_url, body=json.dumps({"order_id": self.order_id}))
 
         exchange_order_id, timestamp = self.async_run_with_timeout(self.exchange._place_order(
             order_id=self.order_id,
@@ -141,18 +147,16 @@ class SeraExchangeTests(unittest.TestCase):
 
         self.assertEqual(self.order_id, exchange_order_id)
         self.assertEqual(1234567890, timestamp)
-        preview_call = self.exchange._api_post.call_args_list[0]
-        self.assertEqual(CONSTANTS.PREVIEW_ORDER_PATH_URL, preview_call.kwargs["path_url"])
-        preview_payload = preview_call.kwargs["data"]
+        preview_request = self._all_executed_requests(mock_api, preview_url)[0]
+        preview_payload = json.loads(preview_request.kwargs["data"])
         self.assertEqual(self.wallet_address.lower(), preview_payload["owner_address"])
         self.assertEqual(CONSTANTS.SIDE_BID, preview_payload["side"])
         self.assertEqual(self.base_address, preview_payload["from_address"])
         self.assertEqual(self.quote_address, preview_payload["to_address"])
         self.assertEqual(self.order_id, preview_payload["order_id"])
 
-        order_call = self.exchange._api_post.call_args_list[1]
-        self.assertEqual(CONSTANTS.ORDERS_PATH_URL, order_call.kwargs["path_url"])
-        order_payload = order_call.kwargs["data"]
+        order_request = self._all_executed_requests(mock_api, order_url)[0]
+        order_payload = json.loads(order_request.kwargs["data"])
         self.assertEqual("1000", order_payload["amount"])
         self.assertEqual("1.085", order_payload["price"])
         self.assertEqual("0xsigned", order_payload["signature"])
@@ -162,12 +166,15 @@ class SeraExchangeTests(unittest.TestCase):
             message=preview_response["eip712_order"],
         )
 
+    @aioresponses()
     @patch.object(SeraAuth, "sign_typed_data", return_value="0xcancel")
-    def test_place_cancel_signs_cancel_order_payload(self, sign_mock):
+    def test_place_cancel_signs_cancel_order_payload(self, mock_api, sign_mock):
         tracked_order = self._tracked_order(exchange_order_id=self.order_id)
         uuid_int = self.exchange._encode_standalone_uuid(self.order_id, self.exchange._executor_id)
         self.exchange._order_uuid_ints[self.order_id] = uuid_int
-        self.exchange._api_post.return_value = {"status": "ok"}
+        cancel_url = web_utils.public_rest_url(CONSTANTS.CANCEL_ORDER_PATH_URL)
+        order_status_url = web_utils.private_rest_url(CONSTANTS.ORDER_PATH_URL.format(order_id=self.order_id))
+        mock_api.post(cancel_url, body=json.dumps({"status": "ok"}))
 
         cancelled = self.async_run_with_timeout(self.exchange._place_cancel(
             order_id=tracked_order.client_order_id,
@@ -175,42 +182,48 @@ class SeraExchangeTests(unittest.TestCase):
         ))
 
         self.assertTrue(cancelled)
-        self.exchange._api_get.assert_not_called()
-        cancel_call = self.exchange._api_post.call_args
-        self.assertEqual(CONSTANTS.CANCEL_ORDER_PATH_URL, cancel_call.kwargs["path_url"])
+        self.assertEqual(0, len(self._all_executed_requests(mock_api, order_status_url)))
+        cancel_request = self._all_executed_requests(mock_api, cancel_url)[0]
         self.assertEqual({
             "owner_address": self.wallet_address.lower(),
             "order_id": self.order_id,
             "uuid_int": uuid_int,
             "signature": "0xcancel",
-        }, cancel_call.kwargs["data"])
+        }, json.loads(cancel_request.kwargs["data"]))
         sign_mock.assert_called_once_with(
             domain=self.eip712_domain,
             message_types=CONSTANTS.CANCEL_ORDER_TYPES,
             message={"owner": self.wallet_address.lower(), "orderId": int(uuid_int)},
         )
 
-    def test_request_order_status_maps_pending_with_fill_to_partially_filled(self):
+    @aioresponses()
+    def test_request_order_status_maps_pending_with_fill_to_partially_filled(self, mock_api):
         tracked_order = self._tracked_order(exchange_order_id=self.order_id)
         uuid_int = self.exchange._encode_standalone_uuid(self.order_id, self.exchange._executor_id)
-        self.exchange._api_get.return_value = {
+        order_status_url = web_utils.private_rest_url(CONSTANTS.ORDER_PATH_URL.format(order_id=self.order_id))
+        mock_api.get(order_status_url, body=json.dumps({
             "trade_id": self.order_id,
             "status": "pending",
             "filled_base_amount": "400.0",
             "updated_at": "2026-04-15T08:01:00+00:00",
             "uuid_int": uuid_int,
-        }
+        }))
 
         order_update = self.async_run_with_timeout(self.exchange._request_order_status(tracked_order=tracked_order))
 
         self.assertEqual(OrderState.PARTIALLY_FILLED, order_update.new_state)
         self.assertEqual(self.order_id, order_update.exchange_order_id)
         self.assertEqual(uuid_int, self.exchange._order_uuid_ints[self.order_id])
-        self.assertEqual(CONSTANTS.ORDER_PATH_URL, self.exchange._api_get.call_args.kwargs["limit_id"])
+        request = self._all_executed_requests(mock_api, order_status_url)[0]
+        self.assertEqual(f"Bearer {self.exchange.api_key}:{self.exchange.api_secret}",
+                         request.kwargs["headers"]["Authorization"])
 
-    def test_all_trade_updates_for_order_converts_fill_response(self):
+    @aioresponses()
+    def test_all_trade_updates_for_order_converts_fill_response(self, mock_api):
         tracked_order = self._tracked_order(exchange_order_id=self.order_id)
-        self.exchange._api_get.return_value = {
+        fills_url = web_utils.private_rest_url(CONSTANTS.FILLS_PATH_URL.format(order_id=self.order_id))
+        fills_regex_url = self._regex_url(fills_url)
+        mock_api.get(fills_regex_url, body=json.dumps({
             "items": [
                 {
                     "maker_order_id": "maker-order-id",
@@ -227,7 +240,7 @@ class SeraExchangeTests(unittest.TestCase):
                     },
                 },
             ],
-        }
+        }))
 
         trade_updates = self.async_run_with_timeout(self.exchange._all_trade_updates_for_order(tracked_order))
 
@@ -239,9 +252,14 @@ class SeraExchangeTests(unittest.TestCase):
         self.assertEqual(Decimal("0.75"), trade_update.fill_price)
         self.assertEqual("USDC", trade_update.fee.flat_fees[0].token)
         self.assertEqual(Decimal("0.01"), trade_update.fee.flat_fees[0].amount)
+        request = self._all_executed_requests(mock_api, fills_url)[0]
+        self.assertEqual({"limit": 500, "offset": 0}, request.kwargs["params"])
 
-    def test_update_balances_converts_raw_vault_available_and_total(self):
-        self.exchange._api_get.return_value = {
+    @aioresponses()
+    def test_update_balances_converts_raw_vault_available_and_total(self, mock_api):
+        balances_url = web_utils.private_rest_url(CONSTANTS.BALANCES_PATH_URL)
+        balances_regex_url = self._regex_url(balances_url)
+        mock_api.get(balances_regex_url, body=json.dumps({
             "balances": [
                 {
                     "token": self.base_address,
@@ -254,16 +272,35 @@ class SeraExchangeTests(unittest.TestCase):
                     "total": "1750000000",
                 },
             ],
-        }
+        }))
 
         self.async_run_with_timeout(self.exchange._update_balances())
 
         self.assertEqual(Decimal("1750"), self.exchange._account_balances[self.base_asset])
         self.assertEqual(Decimal("400"), self.exchange._account_available_balances[self.base_asset])
+        request = self._all_executed_requests(mock_api, balances_url)[0]
         self.assertEqual(
             {"owner_address": self.wallet_address.lower()},
-            self.exchange._api_get.call_args.kwargs["params"],
+            request.kwargs["params"],
         )
+
+    @staticmethod
+    def _regex_url(url: str):
+        return re.compile(f"^{url}".replace(".", r"\.").replace("?", r"\?"))
+
+    @staticmethod
+    def _all_executed_requests(api_mock: aioresponses, url):
+        request_calls = []
+        for key, value in api_mock.requests.items():
+            req_url = key[1].human_repr()
+            its_a_match = (
+                url.search(req_url)
+                if isinstance(url, re.Pattern)
+                else req_url == url or req_url.startswith(f"{url}?")
+            )
+            if its_a_match:
+                request_calls.extend(value)
+        return request_calls
 
     def _tracked_order(self, exchange_order_id: str) -> InFlightOrder:
         return InFlightOrder(

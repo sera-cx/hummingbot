@@ -31,6 +31,7 @@ from hummingbot.core.rate_oracle.sources.kucoin_rate_source import KucoinRateSou
 from hummingbot.core.rate_oracle.sources.mexc_rate_source import MexcRateSource
 from hummingbot.core.rate_oracle.sources.pacifica_perpetual_rate_source import PacificaPerpetualRateSource
 from hummingbot.core.rate_oracle.sources.rate_source_base import RateSourceBase
+from hummingbot.core.rate_oracle.sources.wise_rate_source import WiseRateSource
 from hummingbot.core.rate_oracle.utils import find_rate
 from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.logger import HummingbotLogger
@@ -54,6 +55,7 @@ RATE_ORACLE_SOURCES = {
     "evedex_perpetual": EvedexPerpetualRateSource,
     "pacifica_perpetual": PacificaPerpetualRateSource,
     "decibel_perpetual": DecibelPerpetualRateSource,
+    "wise": WiseRateSource,
 }
 
 
@@ -205,8 +207,11 @@ class RateOracle(NetworkBase):
         :param base_token: The token symbol that we want to price, e.g. BTC
         :return A conversion rate
         """
-        prices = await self._source.get_prices(quote_token=self._quote_token)
         pair = combine_to_hb_trading_pair(base=base_token, quote=self._quote_token)
+        if hasattr(self._source, "get_prices_for_pairs"):
+            prices = await self._source.get_prices_for_pairs([pair])
+        else:
+            prices = await self._source.get_prices(quote_token=self._quote_token)
         return find_rate(prices, pair)
 
     def get_pair_rate(self, pair: str) -> Optional[Decimal]:
@@ -256,7 +261,10 @@ class RateOracle(NetworkBase):
         :param pair: A trading pair, e.g. BTC-USDT
         :return A conversion rate
         """
-        prices = await self._source.get_prices(quote_token=self._quote_token)
+        if hasattr(self._source, "get_prices_for_pairs"):
+            prices = await self._source.get_prices_for_pairs([pair])
+        else:
+            prices = await self._source.get_prices(quote_token=self._quote_token)
         return find_rate(prices, pair)
 
     def set_price(self, pair: str, price: Decimal):
