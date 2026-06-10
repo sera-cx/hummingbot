@@ -167,6 +167,63 @@ price_type: mid_price
 take_if_crossed: true
 ```
 
+### Add a PMM Price Ladder
+
+Use a price ladder when you want PMM to place multiple orders on each side of the mid price instead of one bid and one ask.
+
+For a simple evenly-spaced ladder, edit:
+
+```text
+conf/strategies/conf_pmm_sera.yml
+```
+
+Example:
+
+```yaml
+bid_spread: 1
+ask_spread: 1
+order_amount: 20
+
+order_levels: 3
+order_level_spread: 0.5
+order_level_amount: 5
+```
+
+PMM config spreads are percentages, so `1` means `1%` and `0.5` means `0.5%`.
+
+With the example above, PMM places:
+
+```text
+Bid levels: 1.0%, 1.5%, 2.0% below mid
+Ask levels: 1.0%, 1.5%, 2.0% above mid
+Amounts:    20, 25, 30 base units per side
+```
+
+For a custom asymmetric ladder, enable split order levels. This overrides `order_amount`, `order_level_spread`, and `order_level_amount`:
+
+```yaml
+split_order_levels_enabled: true
+
+bid_order_level_spreads: 0.5,1,2
+ask_order_level_spreads: 0.75,1.5,3
+bid_order_level_amounts: 10,15,25
+ask_order_level_amounts: 8,12,20
+```
+
+With split levels enabled, PMM uses the comma-separated spread and amount at each index:
+
+```text
+Bid 1: 10 XSGD at 0.5% below mid
+Bid 2: 15 XSGD at 1.0% below mid
+Bid 3: 25 XSGD at 2.0% below mid
+
+Ask 1: 8 XSGD at 0.75% above mid
+Ask 2: 12 XSGD at 1.5% above mid
+Ask 3: 20 XSGD at 3.0% above mid
+```
+
+Keep enough Sera vault balance for the full ladder, not just the top order. For the simple ladder example, PMM may reserve `20 + 25 + 30 = 75` base units for asks, plus enough quote balance for all bid levels.
+
 The client rate oracle should be set to Wise for `XSGD-USDC`:
 
 ```yaml
@@ -223,7 +280,149 @@ localhost:1883
 
 If Hummingbot logs MQTT connection errors, restart the broker and verify Docker is running before starting Hummingbot again.
 
-## 9. Ensure Sera Vault Balances Are Available
+## 9. Run Hummingbot API for Condor Integration
+
+Condor talks to running bots through Hummingbot API. The Hummingbot API stack includes:
+
+```text
+API: http://localhost:8000
+Swagger UI: http://localhost:8000/docs
+PostgreSQL: localhost:5432
+EMQX MQTT broker: localhost:1883
+EMQX Dashboard: http://localhost:18083
+```
+
+If you use Hummingbot API's bundled EMQX broker, do not also run the standalone broker from section 8 on the same machine, because both try to bind `localhost:1883`. Either stop the standalone broker first or configure one of the stacks to use a different MQTT port.
+
+From an empty directory outside this repo, install and start Hummingbot API with Docker:
+
+```bash
+mkdir -p /private/tmp/hummingbot-api-deploy
+cd /private/tmp/hummingbot-api-deploy
+curl -fsSL https://raw.githubusercontent.com/hummingbot/deploy/main/setup.sh | bash -s -- --hummingbot-api
+```
+
+The installer clones `hummingbot-api`, creates its `.env`, pulls Docker images, and starts the API, PostgreSQL, and EMQX containers. After it finishes, verify the API:
+
+```bash
+curl http://localhost:8000/health
+open http://localhost:8000/docs
+```
+
+If you cloned `hummingbot-api` manually, the equivalent workflow is:
+
+```bash
+git clone https://github.com/hummingbot/hummingbot-api /private/tmp/hummingbot-api
+cd /private/tmp/hummingbot-api
+make setup
+make deploy
+```
+
+Important `.env` values in the `hummingbot-api` repo:
+
+```text
+USERNAME=admin
+PASSWORD=admin
+CONFIG_PASSWORD=1234
+```
+
+Use the same `CONFIG_PASSWORD` that decrypts this Hummingbot repo's connector config when the API launches or manages bot containers that need Sera credentials.
+
+### Make Sure Hummingbot API Uses a Bot Image with Sera
+
+Hummingbot API does not automatically use the connector code from this local checkout. It launches Hummingbot bot instances from the bot image configured in the Hummingbot API deployment.
+
+That means:
+
+```text
+This local repo: has the Sera connector.
+Default official Hummingbot bot image: may not have the Sera connector.
+Custom bot image built from this branch: has the Sera connector.
+```
+
+Build a custom bot image from this repo after the Sera connector and PMM changes are present:
+
+```bash
+cd /Users/shikai/Code/hummingbot
+docker build -t hummingbot-sera:local .
+```
+
+Then configure the Hummingbot API deployment to launch bot containers from that image. The exact environment variable name can vary by `hummingbot-api` version, but look in the `hummingbot-api` `.env` or `docker-compose.yml` for the bot image setting and point it to:
+
+```text
+hummingbot-sera:local
+```
+
+Common names to look for are:
+
+```text
+HUMMINGBOT_IMAGE
+BOT_IMAGE
+HUMMINGBOT_DOCKER_IMAGE
+```
+
+After changing the image setting, restart Hummingbot API:
+
+```bash
+cd /private/tmp/hummingbot-api
+make deploy
+```
+
+If the API was installed by the deploy helper into a different folder, run `make deploy` from that `hummingbot-api` folder instead.
+
+The bot container also needs the Sera strategy and connector credentials. Make sure the API-managed bot has access to:
+
+```text
+conf/connectors/sera.yml
+conf/strategies/conf_pmm_sera.yml
+CONFIG_PASSWORD
+```
+
+If Condor can reach Hummingbot API but Sera is missing from connector lists or bot startup fails with an unknown connector error, the API is probably still using a Hummingbot image that does not include this Sera branch.
+
+Install Condor
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/hummingbot/deploy/main/setup.sh | bash
+```
+
+In Condor, add the Hummingbot API server from Telegram:
+
+```text
+/servers
+```
+
+For a local Condor and local Hummingbot API setup, use:
+
+```text
+API URL: http://localhost:8000
+Username: admin
+Password: admin
+```
+
+For Condor running on another machine, expose the API over a private network such as Tailscale and use the private URL, for example:
+
+```text
+API URL: http://hummingbot-api:8000
+```
+
+Once Condor can reach Hummingbot API, use:
+
+```text
+/servers   check API connectivity
+/keys      add or verify Sera credentials
+/bots      monitor running bots
+/new_bot   create bot configs through the API
+```
+
+Reference docs:
+
+```text
+Hummingbot API: https://github.com/hummingbot/hummingbot-api
+Condor: https://hummingbot.org/condor/
+```
+
+## 10. Ensure Sera Vault Balances Are Available
 
 The Sera connector reports Hummingbot available balances from Sera `vault_available`, not from wallet totals. If PMM logs proposals with `buys=0` and `sells=0`, check whether vault balances are zero or frozen.
 
@@ -236,7 +435,7 @@ USDC vault_available >= 20 * oracle_mid_price
 
 After funds are in the vault, Hummingbot can reserve part of the balance as `vault_frozen` for live orders.
 
-## 10. Start Hummingbot Headless with PMM
+## 11. Start Hummingbot Headless with PMM
 
 Activate the environment and start the client:
 

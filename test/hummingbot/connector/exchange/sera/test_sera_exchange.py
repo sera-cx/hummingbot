@@ -110,6 +110,23 @@ class SeraExchangeTests(unittest.TestCase):
             uuid_int,
         )
 
+    def test_validate_eip712_domain_accepts_expected_contract_address(self):
+        self.exchange._validate_eip712_domain({
+            "name": CONSTANTS.EIP712_DOMAIN_NAME,
+            "version": CONSTANTS.EIP712_DOMAIN_VERSION,
+            "chainId": str(CONSTANTS.EIP712_CHAIN_ID),
+            "verifyingContract": CONSTANTS.EIP712_VERIFYING_CONTRACT.lower(),
+        })
+
+    def test_validate_eip712_domain_rejects_contract_address_mismatch(self):
+        with self.assertRaisesRegex(ValueError, "EIP-712 domain mismatch for verifyingContract"):
+            self.exchange._validate_eip712_domain({
+                "name": CONSTANTS.EIP712_DOMAIN_NAME,
+                "version": CONSTANTS.EIP712_DOMAIN_VERSION,
+                "chainId": CONSTANTS.EIP712_CHAIN_ID,
+                "verifyingContract": "0x0000000000000000000000000000000000000001",
+            })
+
     @aioresponses()
     @patch.object(SeraAuth, "sign_typed_data", return_value="0xsigned")
     def test_place_order_previews_signs_and_submits_normalized_payload(self, mock_api, sign_mock):
@@ -165,6 +182,77 @@ class SeraExchangeTests(unittest.TestCase):
             message_types=CONSTANTS.ORDER_TYPES,
             message=preview_response["eip712_order"],
         )
+
+    def test_validate_previewed_eip712_order_accepts_intended_buy_order(self):
+        preview_response = {
+            "normalized_amount": "1000",
+            "normalized_price": "1.085",
+            "eip712_order": {
+                "user": self.wallet_address,
+                "expiration": "1713254400",
+                "feeBps": "0",
+                "recipient": CONSTANTS.ZERO_ADDRESS,
+                "fromToken": self.quote_address,
+                "toToken": self.base_address,
+                "fromAmount": "1085000000",
+                "toAmount": "1000000000",
+                "initialDepositAmount": "0",
+                "uuid": self.exchange._encode_standalone_uuid(self.order_id, self.exchange._executor_id),
+            },
+            "eip712_types": CONSTANTS.ORDER_TYPES,
+        }
+        preview_payload = {
+            "owner_address": self.wallet_address.lower(),
+            "amount": "1000",
+            "price": "1.085",
+            "uuid_int": self.exchange._encode_standalone_uuid(self.order_id, self.exchange._executor_id),
+            "expiration": 1713254400,
+        }
+
+        self.exchange._validate_previewed_eip712_order(
+            preview_payload=preview_payload,
+            preview=preview_response,
+            market=self.market_info,
+            trade_type=TradeType.BUY,
+            amount=Decimal("1000"),
+            price=Decimal("1.085"),
+        )
+
+    def test_validate_previewed_eip712_order_rejects_mismatch(self):
+        preview_response = {
+            "normalized_amount": "1000",
+            "normalized_price": "1.085",
+            "eip712_order": {
+                "user": "0x0000000000000000000000000000000000000002",
+                "expiration": "1713254400",
+                "feeBps": "0",
+                "recipient": CONSTANTS.ZERO_ADDRESS,
+                "fromToken": self.quote_address,
+                "toToken": self.base_address,
+                "fromAmount": "1085000000",
+                "toAmount": "1000000000",
+                "initialDepositAmount": "0",
+                "uuid": self.exchange._encode_standalone_uuid(self.order_id, self.exchange._executor_id),
+            },
+            "eip712_types": CONSTANTS.ORDER_TYPES,
+        }
+        preview_payload = {
+            "owner_address": self.wallet_address.lower(),
+            "amount": "1000",
+            "price": "1.085",
+            "uuid_int": self.exchange._encode_standalone_uuid(self.order_id, self.exchange._executor_id),
+            "expiration": 1713254400,
+        }
+
+        with self.assertRaisesRegex(ValueError, "previewed EIP-712 order mismatch for user"):
+            self.exchange._validate_previewed_eip712_order(
+                preview_payload=preview_payload,
+                preview=preview_response,
+                market=self.market_info,
+                trade_type=TradeType.BUY,
+                amount=Decimal("1000"),
+                price=Decimal("1.085"),
+            )
 
     @aioresponses()
     @patch.object(SeraAuth, "sign_typed_data", return_value="0xcancel")

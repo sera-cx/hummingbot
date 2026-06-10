@@ -367,6 +367,15 @@ class SeraExchange(ExchangePyBase):
             limit_id=CONSTANTS.PREVIEW_ORDER_PATH_URL,
         )
         eip712_order = preview["eip712_order"]
+        self._validate_eip712_domain(preview.get("eip712_domain") or self._eip712_domain)
+        self._validate_previewed_eip712_order(
+            preview_payload=preview_payload,
+            preview=preview,
+            market=market,
+            trade_type=trade_type,
+            amount=amount,
+            price=price,
+        )
         signature = self.authenticator.sign_typed_data(
             domain=self._eip712_domain,
             message_types=preview.get("eip712_types") or CONSTANTS.ORDER_TYPES,
@@ -385,6 +394,67 @@ class SeraExchange(ExchangePyBase):
             limit_id=CONSTANTS.ORDERS_PATH_URL,
         )
         return str(order_result["order_id"]), self.current_timestamp
+
+    def _validate_previewed_eip712_order(
+            self,
+            preview_payload: Dict[str, Any],
+            preview: Dict[str, Any],
+            market: Dict[str, Any],
+            trade_type: TradeType,
+            amount: Decimal,
+            price: Decimal,
+    ):
+        eip712_order = preview["eip712_order"]
+        normalized_amount = Decimal(str(preview.get("normalized_amount", preview_payload["amount"])))
+        normalized_price = Decimal(str(preview.get("normalized_price", preview_payload["price"])))
+        for field, actual, expected_value in (
+            ("amount", normalized_amount, amount),
+            ("price", normalized_price, price),
+        ):
+            if actual != expected_value:
+                raise ValueError(f"Sera preview normalized {field} {actual} does not match requested {field} {expected_value}.")
+
+        base_raw_amount = self._decimal_to_raw_units(amount=amount, decimals=int(market["base_decimals"]))
+        quote_raw_amount = self._decimal_to_raw_units(amount=amount * price, decimals=int(market["quote_decimals"]))
+        from_token, to_token, from_amount, to_amount = (
+            (market["quote_address"], market["base_address"], quote_raw_amount, base_raw_amount)
+            if trade_type is TradeType.BUY
+            else (market["base_address"], market["quote_address"], base_raw_amount, quote_raw_amount)
+        )
+        expected = {
+            "user": preview_payload["owner_address"],
+            "expiration": preview_payload["expiration"],
+            "feeBps": "0",
+            "recipient": CONSTANTS.ZERO_ADDRESS,
+            "fromToken": from_token,
+            "toToken": to_token,
+            "fromAmount": from_amount,
+            "toAmount": to_amount,
+            "initialDepositAmount": "0",
+            "uuid": preview_payload["uuid_int"],
+        }
+        for field, expected_value in expected.items():
+            actual = eip712_order.get(field)
+            if not self._eip712_values_match(actual, expected_value):
+                raise ValueError(
+                    f"Sera previewed EIP-712 order mismatch for {field}: expected {expected_value!r}, got {actual!r}."
+                )
+
+    @classmethod
+    def _validate_eip712_domain(cls, eip712_domain: Dict[str, Any]):
+        expected = {
+            "name": CONSTANTS.EIP712_DOMAIN_NAME,
+            "version": CONSTANTS.EIP712_DOMAIN_VERSION,
+            "chainId": CONSTANTS.EIP712_CHAIN_ID,
+            "verifyingContract": CONSTANTS.EIP712_VERIFYING_CONTRACT,
+        }
+        eip712_domain = eip712_domain or {}
+        for field, expected_value in expected.items():
+            actual = eip712_domain.get(field)
+            if not cls._eip712_values_match(actual, expected_value):
+                raise ValueError(
+                    f"Sera EIP-712 domain mismatch for {field}: expected {expected_value!r}, got {actual!r}."
+                )
 
     async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder):
         await self._ensure_exchange_config()
@@ -530,7 +600,9 @@ class SeraExchange(ExchangePyBase):
                 is_auth_required=False,
                 limit_id=CONSTANTS.CONFIG_PATH_URL,
             )
-            self._eip712_domain = config["eip712_domain"]
+            eip712_domain = config["eip712_domain"]
+            self._validate_eip712_domain(eip712_domain)
+            self._eip712_domain = eip712_domain
         if len(self._token_info_by_symbol) == 0:
             tokens = await self._api_get(
                 path_url=CONSTANTS.TOKENS_PATH_URL,
@@ -555,6 +627,22 @@ class SeraExchange(ExchangePyBase):
         raw = int(uuid.UUID(order_id))
         group = raw >> 16
         return str((executor_id << 252) | (raw << 124) | (group << 12))
+
+    @staticmethod
+    def _decimal_to_raw_units(amount: Decimal, decimals: int) -> str:
+        raw_amount = amount * (Decimal("10") ** decimals)
+        if raw_amount != raw_amount.to_integral_value():
+            raise ValueError(f"Amount {amount} is not exactly representable with {decimals} decimals.")
+        return str(int(raw_amount))
+
+    @staticmethod
+    def _eip712_values_match(actual: Any, expected: Any) -> bool:
+        if isinstance(actual, str) and actual.startswith("0x") and isinstance(expected, str) and expected.startswith("0x"):
+            return actual.lower() == expected.lower()
+        try:
+            return int(actual) == int(expected)
+        except (TypeError, ValueError):
+            return str(actual) == str(expected)
 
     @staticmethod
     def _trading_pair_from_market(market: Dict[str, Any]) -> str:
