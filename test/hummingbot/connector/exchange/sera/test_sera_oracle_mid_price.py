@@ -36,6 +36,11 @@ class SeraOracleMidPriceTest(unittest.TestCase):
             self.exchange.get_price_by_type(self.trading_pair, PriceType.MidPrice),
         )
 
+    def test_get_mid_price_does_not_recurse_through_rate_oracle_connector_fallback(self):
+        RateOracle.get_instance().register_connector(self.exchange)
+
+        self.assertTrue(self.exchange.get_mid_price(self.trading_pair).is_nan())
+
     def test_get_mid_price_uses_order_book_when_available(self):
         RateOracle.get_instance().set_price(self.trading_pair, Decimal("1.0875"))
         order_book = OrderBook()

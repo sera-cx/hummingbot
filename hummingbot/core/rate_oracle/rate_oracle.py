@@ -214,23 +214,25 @@ class RateOracle(NetworkBase):
             prices = await self._source.get_prices(quote_token=self._quote_token)
         return find_rate(prices, pair)
 
-    def get_pair_rate(self, pair: str) -> Optional[Decimal]:
+    def get_pair_rate(self, pair: str, include_connector_rates: bool = True) -> Optional[Decimal]:
         """
         Finds a conversion rate for a given trading pair. The lookup tries, in order:
           1. the configured rate source cache (direct pair)
-          2. registered connectors' live order books (direct and reverse pair)
+          2. registered connectors' live order books (direct and reverse pair), when enabled
           3. the configured rate source cache (reverse pair, inverted)
         Returns ``None`` when no rate can be resolved.
 
         :param pair: A trading pair, e.g. BTC-USDT
+        :param include_connector_rates: Whether registered live connector order books can be used as a fallback.
         :return A conversion rate, or ``None`` if no rate is available
         """
         rate = find_rate(self._prices, pair)
         if rate is not None and rate > Decimal("0"):
             return rate
-        connector_rate = self._get_rate_from_connectors(pair)
-        if connector_rate is not None:
-            return connector_rate
+        if include_connector_rates:
+            connector_rate = self._get_rate_from_connectors(pair)
+            if connector_rate is not None:
+                return connector_rate
         base, quote = split_hb_trading_pair(pair)
         reverse_pair = combine_to_hb_trading_pair(base=quote, quote=base)
         reverse_rate = find_rate(self._prices, reverse_pair)

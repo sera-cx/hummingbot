@@ -198,7 +198,7 @@ class SeraExchange(ExchangePyBase):
 
     @staticmethod
     def _get_oracle_mid_price(trading_pair: str) -> Optional[Decimal]:
-        oracle_price = RateOracle.get_instance().get_pair_rate(trading_pair)
+        oracle_price = RateOracle.get_instance().get_pair_rate(trading_pair, include_connector_rates=False)
         if oracle_price is not None and oracle_price > Decimal("0"):
             return oracle_price
         return None

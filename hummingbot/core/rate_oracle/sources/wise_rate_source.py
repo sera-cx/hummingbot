@@ -74,8 +74,8 @@ class WiseRateSource(RateSourceBase):
         return results
 
     async def get_prices(self, quote_token: Optional[str] = None) -> Dict[str, Decimal]:
-        trading_pairs = self._trading_pairs
-        if quote_token is not None:
+        trading_pairs = list(self._trading_pairs)
+        if quote_token is not None and not trading_pairs:
             trading_pairs = [
                 pair for pair in trading_pairs
                 if self._map_currency(split_hb_trading_pair(pair)[1]) == quote_token.upper()
