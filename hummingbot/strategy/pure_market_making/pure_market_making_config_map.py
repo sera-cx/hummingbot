@@ -106,11 +106,18 @@ def exchange_on_validated(value: str):
     required_exchanges.add(value)
 
 
-def validate_decimal_list(value: str) -> Optional[str]:
+def validate_decimal_list(
+        value: str,
+        min_value: Decimal = Decimal("0"),
+        max_value: Decimal = Decimal("100"),
+        inclusive: bool = False,
+) -> Optional[str]:
     decimal_list = list(value.split(","))
     for number in decimal_list:
         try:
-            validate_result = validate_decimal(Decimal(number), 0, 100, inclusive=False)
+            validate_result = validate_decimal(
+                number.strip(), min_value=min_value, max_value=max_value, inclusive=inclusive
+            )
         except decimal.InvalidOperation:
             return "Please enter valid decimal numbers"
         if validate_result is not None:
@@ -411,7 +418,7 @@ pure_market_making_config_map = {
                   type_str="str",
                   required_if=lambda: pure_market_making_config_map.get(
                       "split_order_levels_enabled").value,
-                  validator=validate_decimal_list),
+                  validator=lambda v: validate_decimal_list(v)),
     "ask_order_level_spreads":
         ConfigVar(key="ask_order_level_spreads",
                   prompt="Enter the spreads (as percentage) for all ask spreads "
@@ -422,7 +429,7 @@ pure_market_making_config_map = {
                   type_str="str",
                   required_if=lambda: pure_market_making_config_map.get(
                       "split_order_levels_enabled").value,
-                  validator=validate_decimal_list),
+                  validator=lambda v: validate_decimal_list(v)),
     "bid_order_level_amounts":
         ConfigVar(key="bid_order_level_amounts",
                   prompt="Enter the amount for all bid amounts. "
@@ -433,7 +440,7 @@ pure_market_making_config_map = {
                   type_str="str",
                   required_if=lambda: pure_market_making_config_map.get(
                       "split_order_levels_enabled").value,
-                  validator=validate_decimal_list),
+                  validator=lambda v: validate_decimal_list(v, min_value=Decimal("0"), max_value=None)),
     "ask_order_level_amounts":
         ConfigVar(key="ask_order_level_amounts",
                   prompt="Enter the amount for all ask amounts. "
@@ -444,5 +451,5 @@ pure_market_making_config_map = {
                   required_if=lambda: pure_market_making_config_map.get(
                       "split_order_levels_enabled").value,
                   type_str="str",
-                  validator=validate_decimal_list),
+                  validator=lambda v: validate_decimal_list(v, min_value=Decimal("0"), max_value=None)),
 }

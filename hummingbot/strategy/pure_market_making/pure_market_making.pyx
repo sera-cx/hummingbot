@@ -138,6 +138,7 @@ cdef class PureMarketMakingStrategy(StrategyBase):
         self._all_markets_ready = False
         self._filled_buys_balance = 0
         self._filled_sells_balance = 0
+        self._filled_base_balance = s_decimal_zero
         self._logging_options = logging_options
         self._last_timestamp = 0
         self._status_report_interval = status_report_interval
@@ -886,6 +887,7 @@ cdef class PureMarketMakingStrategy(StrategyBase):
     cdef c_apply_order_size_modifiers(self, object proposal):
         if self._inventory_skew_enabled:
             self.c_apply_inventory_skew(proposal)
+        self.c_apply_filled_base_balance(proposal)
 
     cdef c_apply_inventory_skew(self, object proposal):
         cdef:
@@ -916,6 +918,22 @@ cdef class PureMarketMakingStrategy(StrategyBase):
             size = sell.size * ask_adj_ratio
             size = market.c_quantize_order_amount(self.trading_pair, size, sell.price)
             sell.size = size
+
+    cdef c_apply_filled_base_balance(self, object proposal):
+        cdef:
+            ExchangeBase market = self._market_info.market
+            object adjusted_size
+
+        if self._filled_base_balance > s_decimal_zero and len(proposal.sells) > 0:
+            adjusted_size = proposal.sells[0].size + self._filled_base_balance
+            proposal.sells[0].size = market.c_quantize_order_amount(
+                self.trading_pair, adjusted_size, proposal.sells[0].price
+            )
+        elif self._filled_base_balance < s_decimal_zero and len(proposal.buys) > 0:
+            adjusted_size = proposal.buys[0].size - self._filled_base_balance
+            proposal.buys[0].size = market.c_quantize_order_amount(
+                self.trading_pair, adjusted_size, proposal.buys[0].price
+            )
 
     def adjusted_available_balance_for_orders_budget_constrain(self):
         candidate_hanging_orders = self.hanging_orders_tracker.candidate_hanging_orders_from_pairs()
@@ -1058,13 +1076,10 @@ cdef class PureMarketMakingStrategy(StrategyBase):
         cdef:
             str order_id = order_filled_event.order_id
             object market_info = self._sb_order_tracker.c_get_shadow_market_pair_from_order_id(order_id)
-            tuple order_fill_record
 
         if market_info is not None:
-            limit_order_record = self._sb_order_tracker.c_get_shadow_limit_order(order_id)
-            order_fill_record = (limit_order_record, order_filled_event)
-
             if order_filled_event.trade_type is TradeType.BUY:
+                self._filled_base_balance += order_filled_event.amount
                 if self._logging_options & self.OPTION_LOG_MAKER_ORDER_FILLED:
                     self.log_with_clock(
                         logging.INFO,
@@ -1072,6 +1087,7 @@ cdef class PureMarketMakingStrategy(StrategyBase):
                         f"{order_filled_event.amount} {market_info.base_asset} filled."
                     )
             else:
+                self._filled_base_balance -= order_filled_event.amount
                 if self._logging_options & self.OPTION_LOG_MAKER_ORDER_FILLED:
                     self.log_with_clock(
                         logging.INFO,
@@ -1081,6 +1097,9 @@ cdef class PureMarketMakingStrategy(StrategyBase):
 
             if self._inventory_cost_price_delegate is not None:
                 self._inventory_cost_price_delegate.process_order_fill_event(order_filled_event)
+
+            self._create_timestamp = self._current_timestamp + self._filled_order_delay
+            self._cancel_timestamp = min(self._cancel_timestamp, self._create_timestamp)
 
     cdef c_did_complete_buy_order(self, object order_completed_event):
         cdef:
@@ -1163,14 +1182,15 @@ cdef class PureMarketMakingStrategy(StrategyBase):
             f"{limit_order_record.price} {limit_order_record.quote_currency} is filled."
         )
 
-    cdef bint c_is_within_tolerance(self, list current_prices, list proposal_prices):
-        if len(current_prices) != len(proposal_prices):
+    cdef bint c_are_orders_within_tolerance(self, list active_orders, list proposal_orders):
+        if len(active_orders) != len(proposal_orders):
             return False
-        current_prices = sorted(current_prices)
-        proposal_prices = sorted(proposal_prices)
-        for current, proposal in zip(current_prices, proposal_prices):
-            # if spread diff is more than the tolerance or order quantities are different, return false.
-            if abs(proposal - current)/current > self._order_refresh_tolerance_pct:
+        active_orders = sorted(active_orders, key=lambda order: order.price)
+        proposal_orders = sorted(proposal_orders, key=lambda order: order.price)
+        for active_order, proposal_order in zip(active_orders, proposal_orders):
+            if abs(proposal_order.price - active_order.price) / active_order.price > self._order_refresh_tolerance_pct:
+                return False
+            if proposal_order.size != Decimal(str(active_order.quantity)):
                 return False
         return True
 
@@ -1194,7 +1214,7 @@ cdef class PureMarketMakingStrategy(StrategyBase):
 
         cdef:
             list active_orders = self.active_non_hanging_orders
-            list active_buy_prices = []
+            list active_buys = []
             list active_sells = []
             bint to_defer_canceling = False
         if len(active_orders) == 0:
@@ -1202,13 +1222,11 @@ cdef class PureMarketMakingStrategy(StrategyBase):
         if proposal is not None and \
                 self._order_refresh_tolerance_pct >= 0:
 
-            active_buy_prices = [Decimal(str(o.price)) for o in active_orders if o.is_buy]
-            active_sell_prices = [Decimal(str(o.price)) for o in active_orders if not o.is_buy]
-            proposal_buys = [buy.price for buy in proposal.buys]
-            proposal_sells = [sell.price for sell in proposal.sells]
+            active_buys = [o for o in active_orders if o.is_buy]
+            active_sells = [o for o in active_orders if not o.is_buy]
 
-            if self.c_is_within_tolerance(active_buy_prices, proposal_buys) and \
-                    self.c_is_within_tolerance(active_sell_prices, proposal_sells):
+            if self.c_are_orders_within_tolerance(active_buys, proposal.buys) and \
+                    self.c_are_orders_within_tolerance(active_sells, proposal.sells):
                 to_defer_canceling = True
 
         if not to_defer_canceling:
@@ -1217,8 +1235,8 @@ cdef class PureMarketMakingStrategy(StrategyBase):
                 # If is about to be added to hanging_orders then don't cancel
                 if not self._hanging_orders_tracker.is_potential_hanging_order(order):
                     self.c_cancel_order(self._market_info, order.client_order_id)
-        # else:
-        #     self.set_timers()
+        else:
+            self.set_timers()
 
     # Cancel Non-Hanging, Active Orders if Spreads are below minimum_spread
     cdef c_cancel_orders_below_min_spread(self):

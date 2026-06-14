@@ -79,6 +79,13 @@ class PureMarketMakingStartTest(IsolatedAsyncioWrapperTestCase):
     def error(self, message, exc_info):
         self.log_errors.append(message)
 
+    async def test_split_order_amount_validator_accepts_amounts_at_or_above_100(self):
+        self.assertIsNone(await c_map.get("bid_order_level_amounts").validate("100,200,300"))
+        self.assertEqual(
+            "Value must be between 0 and 100 (exclusive).",
+            await c_map.get("bid_order_level_spreads").validate("100,200,300"),
+        )
+
     # @patch.object(TradingCore, "initialize_markets")
     async def test_strategy_creation(self):
         await strategy_start.start(self)

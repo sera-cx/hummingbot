@@ -1,3 +1,4 @@
+import asyncio
 import time
 import uuid
 from decimal import Decimal
@@ -20,7 +21,7 @@ from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTr
 from hummingbot.core.data_type.trade_fee import TokenAmount, TradeFeeBase
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
 from hummingbot.core.rate_oracle.rate_oracle import RateOracle
-from hummingbot.core.utils.async_utils import safe_ensure_future, safe_gather
+from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.core.utils.estimate_fee import build_trade_fee
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 
@@ -414,12 +415,20 @@ class SeraExchange(ExchangePyBase):
             if actual != expected_value:
                 raise ValueError(f"Sera preview normalized {field} {actual} does not match requested {field} {expected_value}.")
 
-        base_raw_amount = self._decimal_to_raw_units(amount=amount, decimals=int(market["base_decimals"]))
-        quote_raw_amount = self._decimal_to_raw_units(amount=amount * price, decimals=int(market["quote_decimals"]))
+        base_raw_amount = self._decimal_to_raw_units(
+            amount=normalized_amount, decimals=int(market["base_decimals"])
+        )
+        quote_amount_field = "fromAmount" if trade_type is TradeType.BUY else "toAmount"
+        self._validate_previewed_quote_raw_amount(
+            actual=eip712_order.get(quote_amount_field),
+            amount=normalized_amount,
+            price=normalized_price,
+            decimals=int(market["quote_decimals"]),
+        )
         from_token, to_token, from_amount, to_amount = (
-            (market["quote_address"], market["base_address"], quote_raw_amount, base_raw_amount)
+            (market["quote_address"], market["base_address"], eip712_order.get("fromAmount"), base_raw_amount)
             if trade_type is TradeType.BUY
-            else (market["base_address"], market["quote_address"], base_raw_amount, quote_raw_amount)
+            else (market["base_address"], market["quote_address"], base_raw_amount, eip712_order.get("toAmount"))
         )
         expected = {
             "user": preview_payload["owner_address"],
@@ -439,6 +448,22 @@ class SeraExchange(ExchangePyBase):
                 raise ValueError(
                     f"Sera previewed EIP-712 order mismatch for {field}: expected {expected_value!r}, got {actual!r}."
                 )
+
+    @staticmethod
+    def _validate_previewed_quote_raw_amount(actual: Any, amount: Decimal, price: Decimal, decimals: int):
+        try:
+            actual_raw_amount = Decimal(str(actual))
+        except Exception as exception:
+            raise ValueError(f"Sera previewed EIP-712 quote amount is invalid: {actual!r}.") from exception
+        if actual_raw_amount <= 0 or actual_raw_amount != actual_raw_amount.to_integral_value():
+            raise ValueError(f"Sera previewed EIP-712 quote amount is invalid: {actual!r}.")
+
+        expected_raw_amount = amount * price * (Decimal("10") ** decimals)
+        if abs(actual_raw_amount - expected_raw_amount) > Decimal("1"):
+            raise ValueError(
+                "Sera previewed EIP-712 quote amount mismatch: "
+                f"expected approximately {expected_raw_amount}, got {actual_raw_amount}."
+            )
 
     @classmethod
     def _validate_eip712_domain(cls, eip712_domain: Dict[str, Any]):
@@ -487,6 +512,10 @@ class SeraExchange(ExchangePyBase):
         return True
 
     async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
+        order_data = await self._request_order_status_data(tracked_order=tracked_order)
+        return self._order_update_from_order_data(tracked_order=tracked_order, order_data=order_data)
+
+    async def _request_order_status_data(self, tracked_order: InFlightOrder) -> Dict[str, Any]:
         exchange_order_id = await tracked_order.get_exchange_order_id()
         order_data = await self._api_get(
             path_url=CONSTANTS.ORDER_PATH_URL.format(order_id=exchange_order_id),
@@ -495,9 +524,12 @@ class SeraExchange(ExchangePyBase):
         )
         if order_data.get("uuid_int"):
             self._order_uuid_ints[exchange_order_id] = str(order_data["uuid_int"])
+        return order_data
+
+    def _order_update_from_order_data(self, tracked_order: InFlightOrder, order_data: Dict[str, Any]) -> OrderUpdate:
         return OrderUpdate(
             client_order_id=tracked_order.client_order_id,
-            exchange_order_id=exchange_order_id,
+            exchange_order_id=tracked_order.exchange_order_id,
             trading_pair=tracked_order.trading_pair,
             update_timestamp=self._timestamp_from_order(order_data),
             new_state=self._order_state_from_order_data(order_data=order_data),
@@ -564,11 +596,39 @@ class SeraExchange(ExchangePyBase):
             await self._sleep(60.0)
 
     async def _status_polling_loop_fetch_updates(self):
-        await safe_gather(
-            self._update_balances(),
-            self._update_orders_fills(orders=list(self._order_tracker.all_fillable_orders.values())),
-            self._update_orders(),
-        )
+        await self._update_balances()
+        last_tick = self._last_poll_timestamp / self.UPDATE_ORDER_STATUS_MIN_INTERVAL
+        current_tick = self.current_timestamp / self.UPDATE_ORDER_STATUS_MIN_INTERVAL
+        if self.in_flight_orders and current_tick > last_tick:
+            await self._update_orders_status_and_new_fills(read_calls_used=1)
+
+    async def _update_orders_status_and_new_fills(self, read_calls_used: int = 0):
+        read_calls_this_second = read_calls_used
+        for tracked_order in list(self.in_flight_orders.values()):
+            try:
+                if read_calls_this_second >= CONSTANTS.READ_REQUESTS_PER_SECOND - 2:
+                    await self._sleep(1.0)
+                    read_calls_this_second = 0
+                order_data = await self._request_order_status_data(tracked_order=tracked_order)
+                read_calls_this_second += 1
+                filled_base_amount = Decimal(str(order_data.get("filled_base_amount") or "0"))
+                if filled_base_amount > tracked_order.executed_amount_base:
+                    if read_calls_this_second >= CONSTANTS.READ_REQUESTS_PER_SECOND - 2:
+                        await self._sleep(1.0)
+                        read_calls_this_second = 0
+                    trade_updates = await self._all_trade_updates_for_order(order=tracked_order)
+                    read_calls_this_second += 1
+                    for trade_update in trade_updates:
+                        self._order_tracker.process_trade_update(trade_update)
+                order_update = self._order_update_from_order_data(
+                    tracked_order=tracked_order,
+                    order_data=order_data,
+                )
+                self._order_tracker.process_order_update(order_update)
+            except asyncio.CancelledError:
+                raise
+            except Exception as request_error:
+                await self._handle_update_error_for_active_order(tracked_order, request_error)
 
     async def _get_last_traded_price(self, trading_pair: str) -> float:
         await self._ensure_exchange_config()

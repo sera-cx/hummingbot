@@ -4,7 +4,7 @@ import re
 import unittest
 from decimal import Decimal
 from typing import Awaitable, Dict, List
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from aioresponses import aioresponses
 
@@ -218,6 +218,41 @@ class SeraExchangeTests(unittest.TestCase):
             price=Decimal("1.085"),
         )
 
+    def test_validate_previewed_eip712_order_accepts_preview_rounded_quote_amount(self):
+        preview_response = {
+            "normalized_amount": "117.83357",
+            "normalized_price": "3.141334",
+            "eip712_order": {
+                "user": self.wallet_address,
+                "expiration": "1713254400",
+                "feeBps": "0",
+                "recipient": CONSTANTS.ZERO_ADDRESS,
+                "fromToken": self.quote_address,
+                "toToken": self.base_address,
+                "fromAmount": "370154600",
+                "toAmount": "117833570",
+                "initialDepositAmount": "0",
+                "uuid": self.exchange._encode_standalone_uuid(self.order_id, self.exchange._executor_id),
+            },
+            "eip712_types": CONSTANTS.ORDER_TYPES,
+        }
+        preview_payload = {
+            "owner_address": self.wallet_address.lower(),
+            "amount": "117.83357",
+            "price": "3.141334",
+            "uuid_int": self.exchange._encode_standalone_uuid(self.order_id, self.exchange._executor_id),
+            "expiration": 1713254400,
+        }
+
+        self.exchange._validate_previewed_eip712_order(
+            preview_payload=preview_payload,
+            preview=preview_response,
+            market=self.market_info,
+            trade_type=TradeType.BUY,
+            amount=Decimal("117.83357"),
+            price=Decimal("3.141334"),
+        )
+
     def test_validate_previewed_eip712_order_rejects_mismatch(self):
         preview_response = {
             "normalized_amount": "1000",
@@ -305,6 +340,54 @@ class SeraExchangeTests(unittest.TestCase):
         request = self._all_executed_requests(mock_api, order_status_url)[0]
         self.assertEqual(f"Bearer {self.exchange.api_key}:{self.exchange.api_secret}",
                          request.kwargs["headers"]["Authorization"])
+
+    def test_update_orders_status_skips_fill_request_when_filled_amount_is_unchanged(self):
+        self.exchange.start_tracking_order(
+            order_id="client-order-id",
+            exchange_order_id=self.order_id,
+            trading_pair=self.trading_pair,
+            trade_type=TradeType.BUY,
+            price=Decimal("1.085"),
+            amount=Decimal("1000"),
+            order_type=OrderType.LIMIT,
+        )
+        self.exchange._request_order_status_data = AsyncMock(return_value={
+            "trade_id": self.order_id,
+            "status": "pending",
+            "filled_base_amount": "0",
+            "updated_at": "2026-04-15T08:01:00+00:00",
+        })
+        self.exchange._all_trade_updates_for_order = AsyncMock(return_value=[])
+
+        self.async_run_with_timeout(self.exchange._update_orders_status_and_new_fills())
+
+        self.exchange._request_order_status_data.assert_awaited_once()
+        self.exchange._all_trade_updates_for_order.assert_not_awaited()
+
+    def test_update_orders_status_fetches_fills_only_when_filled_amount_increases(self):
+        self.exchange.start_tracking_order(
+            order_id="client-order-id",
+            exchange_order_id=self.order_id,
+            trading_pair=self.trading_pair,
+            trade_type=TradeType.BUY,
+            price=Decimal("1.085"),
+            amount=Decimal("1000"),
+            order_type=OrderType.LIMIT,
+        )
+        tracked_order = self.exchange.in_flight_orders["client-order-id"]
+        tracked_order.executed_amount_base = Decimal("0.5")
+        self.exchange._request_order_status_data = AsyncMock(return_value={
+            "trade_id": self.order_id,
+            "status": "pending",
+            "filled_base_amount": "0.75",
+            "updated_at": "2026-04-15T08:01:00+00:00",
+        })
+        self.exchange._all_trade_updates_for_order = AsyncMock(return_value=[])
+
+        self.async_run_with_timeout(self.exchange._update_orders_status_and_new_fills())
+
+        self.exchange._request_order_status_data.assert_awaited_once()
+        self.exchange._all_trade_updates_for_order.assert_awaited_once_with(order=tracked_order)
 
     @aioresponses()
     def test_all_trade_updates_for_order_converts_fill_response(self, mock_api):

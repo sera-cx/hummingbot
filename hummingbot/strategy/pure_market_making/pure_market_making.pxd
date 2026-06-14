@@ -51,6 +51,7 @@ cdef class PureMarketMakingStrategy(StrategyBase):
         bint _all_markets_ready
         int _filled_buys_balance
         int _filled_sells_balance
+        object _filled_base_balance
         double _last_timestamp
         double _status_report_interval
         int64_t _logging_options
@@ -68,12 +69,13 @@ cdef class PureMarketMakingStrategy(StrategyBase):
     cdef c_apply_order_price_modifiers(self, object proposal)
     cdef c_apply_order_size_modifiers(self, object proposal)
     cdef c_apply_inventory_skew(self, object proposal)
+    cdef c_apply_filled_base_balance(self, object proposal)
     cdef c_apply_budget_constraint(self, object proposal)
 
     cdef c_filter_out_takers(self, object proposal)
     cdef c_apply_order_optimization(self, object proposal)
     cdef c_apply_add_transaction_costs(self, object proposal)
-    cdef bint c_is_within_tolerance(self, list current_prices, list proposal_prices)
+    cdef bint c_are_orders_within_tolerance(self, list active_orders, list proposal_orders)
     cdef c_cancel_active_orders(self, object proposal)
     cdef c_cancel_orders_below_min_spread(self)
     cdef c_cancel_active_orders_on_max_age_limit(self)
