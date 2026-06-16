@@ -2,7 +2,7 @@ import asyncio
 import time
 import uuid
 from decimal import Decimal
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import dateutil.parser as dp
 from bidict import bidict
@@ -17,6 +17,8 @@ from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.connector.utils import combine_to_hb_trading_pair, split_hb_trading_pair
 from hummingbot.core.data_type.common import OrderType, PriceType, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, OrderUpdate, TradeUpdate
+from hummingbot.core.data_type.limit_order import LimitOrder
+from hummingbot.core.data_type.market_order import MarketOrder
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
 from hummingbot.core.data_type.trade_fee import TokenAmount, TradeFeeBase
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
@@ -247,6 +249,21 @@ class SeraExchange(ExchangePyBase):
         ))
         return order_id
 
+    def batch_order_create(self, orders_to_create: List[Union[LimitOrder, MarketOrder]]) -> List[Union[LimitOrder, MarketOrder]]:
+        limit_orders = [order for order in orders_to_create if isinstance(order, LimitOrder)]
+        if len(limit_orders) != len(orders_to_create):
+            return super().batch_order_create(orders_to_create)
+
+        created_orders = []
+        for orders_group in self._vl_order_groups(limit_orders):
+            if len(orders_group) < 2:
+                created_orders.extend(super().batch_order_create(orders_group))
+            else:
+                orders_with_ids = self._assign_vl_order_ids(orders_group)
+                created_orders.extend(orders_with_ids)
+                safe_ensure_future(self._execute_vl_batch_order_create(orders_to_create=orders_with_ids))
+        return created_orders
+
     def _get_fee(
             self,
             base_currency: str,
@@ -341,13 +358,41 @@ class SeraExchange(ExchangePyBase):
             price: Decimal,
             **kwargs,
     ) -> Tuple[str, float]:
+        order_payload = await self._signed_order_payload(
+            order_id=order_id,
+            trading_pair=trading_pair,
+            amount=amount,
+            trade_type=trade_type,
+            order_type=order_type,
+            price=price,
+            expiration=kwargs.get("expiration"),
+        )
+        order_result = await self._api_post(
+            path_url=CONSTANTS.ORDERS_PATH_URL,
+            data=order_payload,
+            is_auth_required=False,
+            limit_id=CONSTANTS.ORDERS_PATH_URL,
+        )
+        return str(order_result["order_id"]), self.current_timestamp
+
+    async def _signed_order_payload(
+            self,
+            order_id: str,
+            trading_pair: str,
+            amount: Decimal,
+            trade_type: TradeType,
+            order_type: OrderType,
+            price: Decimal,
+            expiration: Optional[int] = None,
+            uuid_int: Optional[str] = None,
+    ) -> Dict[str, Any]:
         if order_type not in [OrderType.LIMIT, OrderType.LIMIT_MAKER]:
             raise ValueError(f"Sera supports limit orders only. Unsupported order type: {order_type}")
         await self._ensure_exchange_config()
         market = self._market_info[trading_pair]
         side = CONSTANTS.SIDE_BID if trade_type is TradeType.BUY else CONSTANTS.SIDE_ASK
-        expiration = kwargs.get("expiration") or await self._new_expiration_timestamp()
-        uuid_int = self._encode_standalone_uuid(order_id=order_id, executor_id=self._executor_id)
+        expiration = expiration or await self._new_expiration_timestamp()
+        uuid_int = uuid_int or self._encode_standalone_uuid(order_id=order_id, executor_id=self._executor_id)
         self._order_uuid_ints[order_id] = uuid_int
         preview_payload = {
             "owner_address": self.wallet_address,
@@ -388,13 +433,131 @@ class SeraExchange(ExchangePyBase):
             "price": preview.get("normalized_price", preview_payload["price"]),
             "signature": signature,
         }
-        order_result = await self._api_post(
-            path_url=CONSTANTS.ORDERS_PATH_URL,
-            data=order_payload,
-            is_auth_required=False,
-            limit_id=CONSTANTS.ORDERS_PATH_URL,
-        )
-        return str(order_result["order_id"]), self.current_timestamp
+        return order_payload
+
+    async def _execute_vl_batch_order_create(self, orders_to_create: List[LimitOrder]):
+        await self._ensure_exchange_config()
+        expiration = await self._new_expiration_timestamp()
+        signed_orders = []
+        try:
+            for leg_id, order in enumerate(orders_to_create):
+                trade_type = TradeType.BUY if order.is_buy else TradeType.SELL
+                uuid_int = self._encode_vl_uuid(order_id=order.client_order_id, executor_id=self._executor_id, leg_id=leg_id)
+                self.start_tracking_order(
+                    order_id=order.client_order_id,
+                    exchange_order_id=None,
+                    trading_pair=order.trading_pair,
+                    order_type=OrderType.LIMIT,
+                    trade_type=trade_type,
+                    price=order.price,
+                    amount=order.quantity,
+                )
+                signed_orders.append(await self._signed_order_payload(
+                    order_id=order.client_order_id,
+                    trading_pair=order.trading_pair,
+                    amount=order.quantity,
+                    trade_type=trade_type,
+                    order_type=OrderType.LIMIT,
+                    price=order.price,
+                    expiration=expiration,
+                    uuid_int=uuid_int,
+                ))
+            order_result = await self._api_post(
+                path_url=CONSTANTS.VL_BATCH_ORDERS_PATH_URL,
+                data={"orders": signed_orders},
+                is_auth_required=False,
+                limit_id=CONSTANTS.VL_BATCH_ORDERS_PATH_URL,
+            )
+            cancelled_orders = order_result.get("cancelled", []) if isinstance(order_result, dict) else []
+            cancelled_order_ids = {
+                str(cancelled.get("order_id"))
+                for cancelled in cancelled_orders
+                if isinstance(cancelled, dict) and cancelled.get("order_id") is not None
+            }
+            for order_id in self._order_ids_from_vl_batch_result(order_result):
+                order = self._order_tracker.fetch_tracked_order(str(order_id))
+                if order is None:
+                    continue
+                self._order_tracker.process_order_update(OrderUpdate(
+                    client_order_id=order.client_order_id,
+                    exchange_order_id=str(order_id),
+                    trading_pair=order.trading_pair,
+                    update_timestamp=self.current_timestamp,
+                    new_state=OrderState.CANCELED if str(order_id) in cancelled_order_ids else OrderState.OPEN,
+                ))
+        except asyncio.CancelledError:
+            raise
+        except Exception as ex:
+            for order in orders_to_create:
+                self._on_order_failure(
+                    order_id=order.client_order_id,
+                    trading_pair=order.trading_pair,
+                    amount=order.quantity,
+                    trade_type=TradeType.BUY if order.is_buy else TradeType.SELL,
+                    order_type=OrderType.LIMIT,
+                    price=order.price,
+                    exception=ex,
+                )
+
+    @classmethod
+    def _vl_order_groups(cls, orders_to_create: List[LimitOrder]) -> List[List[LimitOrder]]:
+        groups = []
+        grouped_orders = {}
+        for order in orders_to_create:
+            grouped_orders.setdefault(cls._vl_spent_asset(order), []).append(order)
+        for orders in grouped_orders.values():
+            for order in orders:
+                group = next(
+                    (
+                        group
+                        for group in groups
+                        if len(group) < 50
+                        and cls._vl_spent_asset(group[0]) == cls._vl_spent_asset(order)
+                        and order.trading_pair not in {group_order.trading_pair for group_order in group}
+                    ),
+                    None,
+                )
+                if group is None:
+                    groups.append([order])
+                else:
+                    group.append(order)
+        return groups
+
+    @staticmethod
+    def _vl_spent_asset(order: LimitOrder) -> str:
+        return order.quote_currency.upper() if order.is_buy else order.base_currency.upper()
+
+    @classmethod
+    def _assign_vl_order_ids(cls, orders_to_create: List[LimitOrder]) -> List[LimitOrder]:
+        base_uuid_int = int(uuid.uuid4()) & ~0xffff
+        return [
+            order.copy_with_id(client_order_id=str(uuid.UUID(int=base_uuid_int | leg_id)))
+            for leg_id, order in enumerate(orders_to_create)
+        ]
+
+    @staticmethod
+    def _encode_vl_uuid(order_id: str, executor_id: int, leg_id: int) -> str:
+        raw = int(uuid.UUID(order_id))
+        group = raw >> 16
+        return str((executor_id << 252) | (raw << 124) | (group << 12) | leg_id)
+
+    @staticmethod
+    def _order_ids_from_vl_batch_result(order_result: Any) -> List[str]:
+        if isinstance(order_result, list):
+            return [
+                str(order.get("order_id", order))
+                for order in order_result
+                if not isinstance(order, dict) or order.get("order_id") is not None
+            ]
+        if not isinstance(order_result, dict):
+            return []
+        if "order_ids" in order_result:
+            return [str(order_id) for order_id in order_result.get("order_ids") or []]
+        return [
+            str(order.get("order_id"))
+            for order in order_result.get("orders", [])
+            if isinstance(order, dict) and order.get("order_id") is not None
+        ]
 
     def _validate_previewed_eip712_order(
             self,

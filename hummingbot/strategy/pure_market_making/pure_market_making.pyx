@@ -85,7 +85,9 @@ cdef class PureMarketMakingStrategy(StrategyBase):
                     bid_order_level_spreads: List[Decimal] = None,
                     ask_order_level_spreads: List[Decimal] = None,
                     should_wait_order_cancel_confirmation: bool = True,
-                    moving_price_band: Optional[MovingPriceBand] = None
+                    moving_price_band: Optional[MovingPriceBand] = None,
+                    use_vl_orders: bool = False,
+                    vl_market_infos: Dict[str, MarketTradingPairTuple] = None,
                     ):
         if order_override is None:
             order_override = {}
@@ -127,6 +129,8 @@ cdef class PureMarketMakingStrategy(StrategyBase):
         self._ping_pong_warning_lines = []
         self._hb_app_notification = hb_app_notification
         self._order_override = order_override
+        self._use_vl_orders = use_vl_orders
+        self._vl_market_infos = {} if vl_market_infos is None else vl_market_infos
         self._split_order_levels_enabled=split_order_levels_enabled
         self._bid_order_level_spreads=bid_order_level_spreads
         self._ask_order_level_spreads=ask_order_level_spreads
@@ -325,6 +329,14 @@ cdef class PureMarketMakingStrategy(StrategyBase):
         self._add_transaction_costs_to_orders = value
 
     @property
+    def use_vl_orders(self) -> bool:
+        return self._use_vl_orders
+
+    @property
+    def vl_order_markets(self) -> List[str]:
+        return list(self._vl_market_infos.keys())
+
+    @property
     def price_ceiling(self) -> Decimal:
         return self._price_ceiling
 
@@ -448,9 +460,17 @@ cdef class PureMarketMakingStrategy(StrategyBase):
 
     @property
     def active_orders(self) -> List[LimitOrder]:
-        if self._market_info not in self.market_info_to_active_orders:
-            return []
-        return self.market_info_to_active_orders[self._market_info]
+        orders = []
+        market_infos = [self._market_info]
+        if self._use_vl_orders:
+            market_infos.extend([
+                market_info
+                for market_info in self._vl_market_infos.values()
+                if market_info != self._market_info
+            ])
+        for market_info in market_infos:
+            orders.extend(self.market_info_to_active_orders.get(market_info, []))
+        return orders
 
     @property
     def active_buys(self) -> List[LimitOrder]:
@@ -923,13 +943,18 @@ cdef class PureMarketMakingStrategy(StrategyBase):
         cdef:
             ExchangeBase market = self._market_info.market
             object adjusted_size
+            object mid_price = self.c_get_mid_price()
 
         if self._filled_base_balance > s_decimal_zero and len(proposal.sells) > 0:
+            if not mid_price.is_nan():
+                proposal.sells[0].price = market.c_quantize_order_price(self.trading_pair, mid_price)
             adjusted_size = proposal.sells[0].size + self._filled_base_balance
             proposal.sells[0].size = market.c_quantize_order_amount(
                 self.trading_pair, adjusted_size, proposal.sells[0].price
             )
         elif self._filled_base_balance < s_decimal_zero and len(proposal.buys) > 0:
+            if not mid_price.is_nan():
+                proposal.buys[0].price = market.c_quantize_order_price(self.trading_pair, mid_price)
             adjusted_size = proposal.buys[0].size - self._filled_base_balance
             proposal.buys[0].size = market.c_quantize_order_amount(
                 self.trading_pair, adjusted_size, proposal.buys[0].price
@@ -1269,6 +1294,9 @@ cdef class PureMarketMakingStrategy(StrategyBase):
             bint orders_created = False
         # Number of pair of orders to track for hanging orders
         number_of_pairs = min((len(proposal.buys), len(proposal.sells))) if self._hanging_orders_enabled else 0
+        if self._use_vl_orders:
+            self.c_execute_orders_proposal_as_batch(proposal, number_of_pairs)
+            return
 
         if len(proposal.buys) > 0:
             if self._logging_options & self.OPTION_LOG_CREATE_ORDER:
@@ -1317,6 +1345,96 @@ cdef class PureMarketMakingStrategy(StrategyBase):
                         self._hanging_orders_tracker.current_created_pairs_of_orders[idx].sell_order = order
         if orders_created:
             self.set_timers()
+
+    cdef c_execute_orders_proposal_as_batch(self, object proposal, int number_of_pairs):
+        cdef:
+            object market = self._market_info.market
+            list orders_to_create = []
+            list created_orders = []
+            object buy, sell, order, market_info, price, tracked_market_info
+            bint orders_created = False
+            int buy_pair_index = 0
+            int sell_pair_index = 0
+
+        for buy in proposal.buys:
+            orders_to_create.append(LimitOrder(
+                client_order_id="",
+                trading_pair=self.trading_pair,
+                is_buy=True,
+                base_currency=self.base_asset,
+                quote_currency=self.quote_asset,
+                price=buy.price,
+                quantity=buy.size,
+            ))
+        for sell in proposal.sells:
+            orders_to_create.append(LimitOrder(
+                client_order_id="",
+                trading_pair=self.trading_pair,
+                is_buy=False,
+                base_currency=self.base_asset,
+                quote_currency=self.quote_asset,
+                price=sell.price,
+                quantity=sell.size,
+            ))
+            for trading_pair, market_info in self._vl_market_infos.items():
+                if trading_pair == self.trading_pair:
+                    continue
+                price = self.c_vl_order_price(trading_pair, sell.price)
+                if price is None:
+                    continue
+                orders_to_create.append(LimitOrder(
+                    client_order_id="",
+                    trading_pair=trading_pair,
+                    is_buy=False,
+                    base_currency=market_info.base_asset,
+                    quote_currency=market_info.quote_asset,
+                    price=price,
+                    quantity=sell.size,
+                ))
+
+        if len(orders_to_create) == 0:
+            return
+
+        created_orders = market.batch_order_create(orders_to_create)
+        for order in created_orders:
+            tracked_market_info = self._vl_market_infos.get(order.trading_pair, self._market_info)
+            self.c_start_tracking_limit_order(
+                tracked_market_info,
+                order.client_order_id,
+                order.is_buy,
+                order.price,
+                order.quantity,
+            )
+            orders_created = True
+            if order.is_buy:
+                if buy_pair_index < number_of_pairs:
+                    self._hanging_orders_tracker.add_current_pairs_of_proposal_orders_executed_by_strategy(
+                        CreatedPairOfOrders(order, None))
+                buy_pair_index += 1
+            else:
+                if sell_pair_index < number_of_pairs:
+                    self._hanging_orders_tracker.current_created_pairs_of_orders[sell_pair_index].sell_order = order
+                sell_pair_index += 1
+
+        if orders_created:
+            self.set_timers()
+
+    cdef object c_vl_order_price(self, str trading_pair, object source_price):
+        cdef:
+            object market = self._market_info.market
+            object source_mid_price = self.c_get_mid_price()
+            object target_mid_price
+            object price_multiplier
+            object target_price
+
+        if source_mid_price is None or source_mid_price.is_nan() or source_mid_price <= s_decimal_zero:
+            return None
+        target_mid_price = market.get_mid_price(trading_pair)
+        if target_mid_price is None or target_mid_price.is_nan() or target_mid_price <= s_decimal_zero:
+            return None
+        price_multiplier = source_price / source_mid_price
+        target_price = target_mid_price * price_multiplier
+        return market.c_quantize_order_price(trading_pair, target_price)
 
     cdef set_timers(self):
         cdef double next_cycle = self._current_timestamp + self._order_refresh_time

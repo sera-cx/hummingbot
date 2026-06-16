@@ -13,6 +13,7 @@ from hummingbot.connector.exchange.sera.sera_auth import SeraAuth
 from hummingbot.connector.exchange.sera.sera_exchange import SeraExchange
 from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState
+from hummingbot.core.data_type.limit_order import LimitOrder
 
 
 class SeraExchangeTests(unittest.TestCase):
@@ -21,11 +22,14 @@ class SeraExchangeTests(unittest.TestCase):
         super().setUpClass()
         cls.base_asset = "EURC"
         cls.quote_asset = "USDC"
+        cls.second_quote_asset = "SGD"
         cls.trading_pair = f"{cls.base_asset}-{cls.quote_asset}"
+        cls.second_trading_pair = f"{cls.base_asset}-{cls.second_quote_asset}"
         cls.private_key = "13e56ca9cceebf1f33065c2c5376ab38570a114bc1b003b60d838f92be9d7930"  # noqa: mock
         cls.wallet_address = "0x1dD6A2730b4f5C154511dBf92de1dC9D8B905Bb6"  # noqa: mock
         cls.base_address = "0xef64d15ed6c371545eb6dcd6c026c17dfb6c440f"  # noqa: mock
         cls.quote_address = "0xDcaEcdd8Db64f4316A11917Ad0162DEBD935285b"  # noqa: mock
+        cls.second_quote_address = "0x00000000000000000000000000000000000000c1"  # noqa: mock
         cls.order_id = "00000000-0000-4000-8000-000000000001"
 
     def setUp(self) -> None:
@@ -41,9 +45,11 @@ class SeraExchangeTests(unittest.TestCase):
         self.exchange._executor_id = 1
         self.exchange._eip712_domain = self.eip712_domain
         self.exchange._market_info[self.trading_pair] = self.market_info
+        self.exchange._market_info[self.second_trading_pair] = self.second_market_info
         self.exchange._token_info_by_symbol = {
             self.base_asset: {"symbol": self.base_asset, "currency": "EUR"},
             self.quote_asset: {"symbol": self.quote_asset, "currency": "USD"},
+            self.second_quote_asset: {"symbol": self.second_quote_asset, "currency": "SGD"},
         }
 
     def tearDown(self) -> None:
@@ -79,6 +85,15 @@ class SeraExchangeTests(unittest.TestCase):
         }
 
     @property
+    def second_market_info(self) -> Dict:
+        return {
+            **self.market_info,
+            "symbol": "EURC/SGD",
+            "quote_symbol": self.second_quote_asset,
+            "quote_address": self.second_quote_address,
+        }
+
+    @property
     def markets_response(self) -> Dict[str, List[Dict]]:
         return {"markets": [self.market_info]}
 
@@ -109,6 +124,37 @@ class SeraExchangeTests(unittest.TestCase):
             "6427948336465191935941739505432058208337171677044006212075520",
             uuid_int,
         )
+
+    def test_encode_vl_uuid_matches_docs_sibling_examples(self):
+        self.assertEqual(
+            "6427948336465191935942058520151046588146668590738473494773760",
+            self.exchange._encode_vl_uuid(
+                order_id="00000000-0000-4000-8000-000000000010",
+                executor_id=0,
+                leg_id=0,
+            ),
+        )
+        self.assertEqual(
+            "6427948336465191935942079787798979146800635051651437980286977",
+            self.exchange._encode_vl_uuid(
+                order_id="00000000-0000-4000-8000-000000000011",
+                executor_id=0,
+                leg_id=1,
+            ),
+        )
+
+    def test_vl_order_groups_use_same_spent_asset_and_unique_markets(self):
+        orders = [
+            self._limit_order(order_id="a", trading_pair=self.trading_pair, is_buy=False),
+            self._limit_order(order_id="b", trading_pair=self.second_trading_pair, is_buy=False),
+            self._limit_order(order_id="c", trading_pair=self.trading_pair, is_buy=False),
+        ]
+
+        groups = self.exchange._vl_order_groups(orders)
+
+        self.assertEqual(2, len(groups))
+        self.assertEqual([self.trading_pair, self.second_trading_pair], [order.trading_pair for order in groups[0]])
+        self.assertEqual([self.trading_pair], [order.trading_pair for order in groups[1]])
 
     def test_validate_eip712_domain_accepts_expected_contract_address(self):
         self.exchange._validate_eip712_domain({
@@ -182,6 +228,79 @@ class SeraExchangeTests(unittest.TestCase):
             message_types=CONSTANTS.ORDER_TYPES,
             message=preview_response["eip712_order"],
         )
+
+    @aioresponses()
+    @patch.object(SeraAuth, "sign_typed_data", return_value="0xsigned")
+    def test_execute_vl_batch_order_create_previews_signs_and_submits_batch(self, mock_api, sign_mock):
+        order_ids = [
+            "00000000-0000-4000-8000-000000000010",
+            "00000000-0000-4000-8000-000000000011",
+        ]
+        orders = [
+            LimitOrder(
+                client_order_id=order_ids[0],
+                trading_pair=self.trading_pair,
+                is_buy=False,
+                base_currency=self.base_asset,
+                quote_currency=self.quote_asset,
+                price=Decimal("1.01"),
+                quantity=Decimal("100"),
+            ),
+            LimitOrder(
+                client_order_id=order_ids[1],
+                trading_pair=self.second_trading_pair,
+                is_buy=False,
+                base_currency=self.base_asset,
+                quote_currency=self.second_quote_asset,
+                price=Decimal("1.02"),
+                quantity=Decimal("100"),
+            ),
+        ]
+        time_url = web_utils.public_rest_url(CONSTANTS.TIME_PATH_URL)
+        preview_url = web_utils.public_rest_url(CONSTANTS.PREVIEW_ORDER_PATH_URL)
+        batch_url = web_utils.public_rest_url(CONSTANTS.VL_BATCH_ORDERS_PATH_URL)
+        mock_api.get(time_url, body=json.dumps({"timestamp": 1713254300}))
+        for order, quote_address, quote_raw_amount, leg_id in zip(
+            orders,
+            [self.quote_address, self.second_quote_address],
+            ["101000000", "102000000"],
+            [0, 1],
+        ):
+            mock_api.post(preview_url, body=json.dumps({
+                "normalized_amount": "100",
+                "normalized_price": f"{order.price:f}",
+                "eip712_order": {
+                    "user": self.wallet_address.lower(),
+                    "expiration": "1713340700",
+                    "feeBps": "0",
+                    "recipient": CONSTANTS.ZERO_ADDRESS,
+                    "fromToken": self.base_address,
+                    "toToken": quote_address,
+                    "fromAmount": "100000000",
+                    "toAmount": quote_raw_amount,
+                    "initialDepositAmount": "0",
+                    "uuid": self.exchange._encode_vl_uuid(order.client_order_id, self.exchange._executor_id, leg_id),
+                },
+                "eip712_types": CONSTANTS.ORDER_TYPES,
+            }))
+        mock_api.post(batch_url, body=json.dumps({"order_ids": order_ids}))
+
+        self.async_run_with_timeout(self.exchange._execute_vl_batch_order_create(orders))
+
+        batch_request = self._all_executed_requests(mock_api, batch_url)[0]
+        batch_payload = json.loads(batch_request.kwargs["data"])
+        self.assertEqual(2, len(batch_payload["orders"]))
+        self.assertEqual([order_ids[0], order_ids[1]], [order["order_id"] for order in batch_payload["orders"]])
+        self.assertEqual([self.trading_pair, self.second_trading_pair], [order.trading_pair for order in orders])
+        self.assertEqual(["0xsigned", "0xsigned"], [order["signature"] for order in batch_payload["orders"]])
+        self.assertEqual(
+            [
+                self.exchange._encode_vl_uuid(order_ids[0], self.exchange._executor_id, 0),
+                self.exchange._encode_vl_uuid(order_ids[1], self.exchange._executor_id, 1),
+            ],
+            [order["uuid_int"] for order in batch_payload["orders"]],
+        )
+        self.assertEqual(2, sign_mock.call_count)
 
     def test_validate_previewed_eip712_order_accepts_intended_buy_order(self):
         preview_response = {
@@ -483,4 +602,16 @@ class SeraExchangeTests(unittest.TestCase):
             amount=Decimal("1000"),
             price=Decimal("1.085"),
             creation_timestamp=1234567890,
+        )
+
+    def _limit_order(self, order_id: str, trading_pair: str, is_buy: bool) -> LimitOrder:
+        base, quote = trading_pair.split("-")
+        return LimitOrder(
+            client_order_id=order_id,
+            trading_pair=trading_pair,
+            is_buy=is_buy,
+            base_currency=base,
+            quote_currency=quote,
+            price=Decimal("1"),
+            quantity=Decimal("100"),
         )

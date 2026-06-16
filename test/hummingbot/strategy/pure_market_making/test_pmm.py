@@ -581,8 +581,8 @@ class PMMUnitTest(unittest.TestCase):
         self.assertEqual(1, len(strategy.active_buys))
         self.assertEqual(1, len(strategy.active_sells))
 
-        # Prices are not adjusted according to filled price as per settings
-        self.assertEqual(Decimal("99"), strategy.active_buys[0].price)
+        # Rebalance order is placed at mid price; regular side keeps spread price.
+        self.assertEqual(Decimal("100"), strategy.active_buys[0].price)
         self.assertEqual(Decimal("101"), strategy.active_sells[0].price)
         self.assertEqual(Decimal("2.0"), strategy.active_buys[0].quantity)
         self.assertEqual(Decimal("1.0"), strategy.active_sells[0].quantity)
@@ -597,6 +597,8 @@ class PMMUnitTest(unittest.TestCase):
         self.simulate_maker_market_trade(False, Decimal("100"), Decimal("98.9"))
         self.clock.backtest_til(self.start_timestamp + 8)
 
+        self.assertEqual(Decimal("99"), strategy.active_buys[0].price)
+        self.assertEqual(Decimal("100"), strategy.active_sells[0].price)
         self.assertEqual(Decimal("1.0"), strategy.active_buys[0].quantity)
         self.assertEqual(Decimal("2.0"), strategy.active_sells[0].quantity)
 
@@ -622,6 +624,8 @@ class PMMUnitTest(unittest.TestCase):
         )
         self.clock.backtest_til(self.start_timestamp + 8)
 
+        self.assertEqual(Decimal("100"), strategy.active_buys[0].price)
+        self.assertEqual(Decimal("101"), strategy.active_sells[0].price)
         self.assertEqual(Decimal("1.4"), strategy.active_buys[0].quantity)
         self.assertEqual(Decimal("1.0"), strategy.active_sells[0].quantity)
 

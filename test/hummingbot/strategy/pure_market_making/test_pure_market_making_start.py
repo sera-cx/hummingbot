@@ -59,6 +59,8 @@ class PureMarketMakingStartTest(IsolatedAsyncioWrapperTestCase):
         c_map.get("order_refresh_tolerance_pct").value = Decimal("2")
         c_map.get("order_override").value = None
         c_map.get("split_order_levels_enabled").value = True
+        c_map.get("use_vl_orders").value = True
+        c_map.get("vl_order_markets").value = "ETH-USDT,ETH-DAI"
         c_map.get("bid_order_level_spreads").value = "1,2"
         c_map.get("ask_order_level_spreads").value = "1,2"
         c_map.get("bid_order_level_amounts").value = "1,2"
@@ -114,6 +116,8 @@ class PureMarketMakingStartTest(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(self.strategy.price_type, PriceType.BestBid)
         self.assertEqual(self.strategy.order_refresh_tolerance_pct, Decimal("0.02"))
         self.assertEqual(self.strategy.split_order_levels_enabled, True)
+        self.assertEqual(self.strategy.use_vl_orders, True)
+        self.assertEqual(self.strategy.vl_order_markets, ["ETH-USDT", "ETH-DAI"])
         self.assertEqual(self.strategy.bid_order_level_spreads, [Decimal("1"), Decimal("2")])
         self.assertEqual(self.strategy.ask_order_level_spreads, [Decimal("1"), Decimal("2")])
         self.assertEqual(self.strategy.order_override, {"split_level_0": ['buy', Decimal("1"), Decimal("1")],

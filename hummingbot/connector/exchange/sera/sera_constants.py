@@ -22,6 +22,7 @@ FX_RATE_PATH_URL = "/fx/rate"
 
 PREVIEW_ORDER_PATH_URL = "/orders/preview"
 ORDERS_PATH_URL = "/orders"
+VL_BATCH_ORDERS_PATH_URL = "/orders/vl/batch"
 CANCEL_ORDER_PATH_URL = "/orders/cancel"
 ORDER_PATH_URL = "/orders/{order_id}"
 FILLS_PATH_URL = "/fills/{order_id}"
@@ -122,6 +123,12 @@ RATE_LIMITS = [
     ),
     RateLimit(
         limit_id=ORDERS_PATH_URL,
+        limit=READ_REQUESTS_PER_SECOND,
+        time_interval=ONE_SECOND,
+        linked_limits=[LinkedLimitWeightPair(TRADING_REQUEST_WEIGHT, 1)],
+    ),
+    RateLimit(
+        limit_id=VL_BATCH_ORDERS_PATH_URL,
         limit=READ_REQUESTS_PER_SECOND,
         time_interval=ONE_SECOND,
         linked_limits=[LinkedLimitWeightPair(TRADING_REQUEST_WEIGHT, 1)],

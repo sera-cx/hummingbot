@@ -44,6 +44,8 @@ cdef class PureMarketMakingStrategy(StrategyBase):
         list _ping_pong_warning_lines
         bint _hb_app_notification
         object _order_override
+        bint _use_vl_orders
+        object _vl_market_infos
 
         double _cancel_timestamp
         double _create_timestamp
@@ -81,5 +83,7 @@ cdef class PureMarketMakingStrategy(StrategyBase):
     cdef c_cancel_active_orders_on_max_age_limit(self)
     cdef bint c_to_create_orders(self, object proposal)
     cdef c_execute_orders_proposal(self, object proposal)
+    cdef c_execute_orders_proposal_as_batch(self, object proposal, int number_of_pairs)
+    cdef object c_vl_order_price(self, str trading_pair, object source_price)
     cdef set_timers(self)
     cdef c_apply_moving_price_band(self, object proposal)

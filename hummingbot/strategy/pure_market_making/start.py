@@ -19,6 +19,11 @@ async def start(self):
         string_list = list(string.split(","))
         return [Decimal(v) / divisor for v in string_list]
 
+    def convert_string_to_list(string: Optional[str]) -> List[str]:
+        if string is None:
+            return []
+        return [value.strip() for value in string.split(",") if value.strip()]
+
     try:
         order_amount = c_map.get("order_amount").value
         order_refresh_time = c_map.get("order_refresh_time").value
@@ -54,6 +59,8 @@ async def start(self):
         order_refresh_tolerance_pct = c_map.get("order_refresh_tolerance_pct").value / Decimal('100')
         order_override = c_map.get("order_override").value
         split_order_levels_enabled = c_map.get("split_order_levels_enabled").value
+        use_vl_orders = c_map.get("use_vl_orders").value
+        vl_order_markets = convert_string_to_list(c_map.get("vl_order_markets").value)
         moving_price_band = MovingPriceBand(
             enabled=c_map.get("moving_price_band_enabled").value,
             price_floor_pct=c_map.get("price_floor_pct").value,
@@ -77,10 +84,22 @@ async def start(self):
             }
         trading_pair: str = raw_trading_pair
         maker_assets: Tuple[str, str] = trading_pair.split("-")
-        market_names: List[Tuple[str, List[str]]] = [(exchange, [trading_pair])]
+        if use_vl_orders:
+            vl_order_markets = list(dict.fromkeys([trading_pair] + vl_order_markets))
+        else:
+            vl_order_markets = []
+        market_names: List[Tuple[str, List[str]]] = [(exchange, list(dict.fromkeys([trading_pair] + vl_order_markets)))]
         await self.initialize_markets(market_names)
         maker_data = [self.connector_manager.connectors[exchange], trading_pair] + list(maker_assets)
-        self.market_trading_pair_tuples = [MarketTradingPairTuple(*maker_data)]
+        vl_market_infos = {
+            vl_market: MarketTradingPairTuple(self.connector_manager.connectors[exchange], vl_market, *vl_market.split("-"))
+            for vl_market in vl_order_markets
+        }
+        self.market_trading_pair_tuples = [MarketTradingPairTuple(*maker_data)] + [
+            market_info
+            for market, market_info in vl_market_infos.items()
+            if market != trading_pair
+        ]
 
         asset_price_delegate = None
         if price_source == "external_market":
@@ -137,7 +156,9 @@ async def start(self):
             bid_order_level_spreads=bid_order_level_spreads,
             ask_order_level_spreads=ask_order_level_spreads,
             should_wait_order_cancel_confirmation=should_wait_order_cancel_confirmation,
-            moving_price_band=moving_price_band
+            moving_price_band=moving_price_band,
+            use_vl_orders=use_vl_orders,
+            vl_market_infos=vl_market_infos,
         )
     except Exception as e:
         self.notify(str(e))
