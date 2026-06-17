@@ -143,5 +143,12 @@ bid_order_level_spreads: null
 ask_order_level_spreads: null
 bid_order_level_amounts: null
 ask_order_level_amounts: null
+
+# Whether to place Sera VL batch orders for configured quote markets.
+use_vl_orders: null
+
+# Sera VL order markets, comma-separated, e.g. XSGD-MYRT,XSGD-USDT
+vl_order_markets: null
+
 # If the strategy should wait to receive cancellations confirmation before creating new orders during refresh time
 should_wait_order_cancel_confirmation: True

@@ -2,6 +2,7 @@ import asyncio
 import json
 import re
 import unittest
+import uuid
 from decimal import Decimal
 from typing import Awaitable, Dict, List
 from unittest.mock import AsyncMock, patch
@@ -156,6 +157,26 @@ class SeraExchangeTests(unittest.TestCase):
         self.assertEqual([self.trading_pair, self.second_trading_pair], [order.trading_pair for order in groups[0]])
         self.assertEqual([self.trading_pair], [order.trading_pair for order in groups[1]])
 
+    def test_assign_vl_order_ids_uses_rng_suffixes(self):
+        orders = [
+            self._limit_order(order_id="", trading_pair=self.trading_pair, is_buy=False),
+            self._limit_order(order_id="", trading_pair=self.second_trading_pair, is_buy=False),
+        ]
+
+        with patch(
+            "hummingbot.connector.exchange.sera.sera_exchange.uuid.uuid4",
+            side_effect=[
+                uuid.UUID("00000000-0000-4000-8000-00000000abcd"),
+                uuid.UUID("00000000-0000-4000-8000-000000001234"),
+                uuid.UUID("00000000-0000-4000-8000-000000005678"),
+            ],
+        ):
+            assigned_orders = self.exchange._assign_vl_order_ids(orders)
+        order_ids = [int(uuid.UUID(order.client_order_id)) for order in assigned_orders]
+
+        self.assertEqual(order_ids[0] >> 16, order_ids[1] >> 16)
+        self.assertEqual([0x1234, 0x5678], [order_id & 0xffff for order_id in order_ids])
+
     def test_validate_eip712_domain_accepts_expected_contract_address(self):
         self.exchange._validate_eip712_domain({
             "name": CONSTANTS.EIP712_DOMAIN_NAME,
@@ -231,7 +252,7 @@ class SeraExchangeTests(unittest.TestCase):
 
     @aioresponses()
     @patch.object(SeraAuth, "sign_typed_data", return_value="0xsigned")
-    def test_execute_vl_batch_order_create_previews_signs_and_submits_batch(self, mock_api, sign_mock):
+    def test_execute_vl_batch_order_create_signs_locally_and_submits_batch(self, mock_api, sign_mock):
         order_ids = [
             "00000000-0000-4000-8000-000000000010",
             "00000000-0000-4000-8000-000000000011",
@@ -257,32 +278,8 @@ class SeraExchangeTests(unittest.TestCase):
             ),
         ]
         time_url = web_utils.public_rest_url(CONSTANTS.TIME_PATH_URL)
-        preview_url = web_utils.public_rest_url(CONSTANTS.PREVIEW_ORDER_PATH_URL)
         batch_url = web_utils.public_rest_url(CONSTANTS.VL_BATCH_ORDERS_PATH_URL)
         mock_api.get(time_url, body=json.dumps({"timestamp": 1713254300}))
-        for order, quote_address, quote_raw_amount, leg_id in zip(
-            orders,
-            [self.quote_address, self.second_quote_address],
-            ["101000000", "102000000"],
-            [0, 1],
-        ):
-            mock_api.post(preview_url, body=json.dumps({
-                "normalized_amount": "100",
-                "normalized_price": f"{order.price:f}",
-                "eip712_order": {
-                    "user": self.wallet_address.lower(),
-                    "expiration": "1713340700",
-                    "feeBps": "0",
-                    "recipient": CONSTANTS.ZERO_ADDRESS,
-                    "fromToken": self.base_address,
-                    "toToken": quote_address,
-                    "fromAmount": "100000000",
-                    "toAmount": quote_raw_amount,
-                    "initialDepositAmount": "0",
-                    "uuid": self.exchange._encode_vl_uuid(order.client_order_id, self.exchange._executor_id, leg_id),
-                },
-                "eip712_types": CONSTANTS.ORDER_TYPES,
-            }))
         mock_api.post(batch_url, body=json.dumps({"order_ids": order_ids}))
 
         self.async_run_with_timeout(self.exchange._execute_vl_batch_order_create(orders))
@@ -301,6 +298,10 @@ class SeraExchangeTests(unittest.TestCase):
             [order["uuid_int"] for order in batch_payload["orders"]],
         )
         self.assertEqual(2, sign_mock.call_count)
+        self.assertEqual(
+            ["101000000", "102000000"],
+            [call.kwargs["message"]["toAmount"] for call in sign_mock.call_args_list],
+        )
 
     def test_validate_previewed_eip712_order_accepts_intended_buy_order(self):
         preview_response = {

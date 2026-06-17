@@ -1434,7 +1434,7 @@ cdef class PureMarketMakingStrategy(StrategyBase):
             return None
         price_multiplier = source_price / source_mid_price
         target_price = target_mid_price * price_multiplier
-        return market.c_quantize_order_price(trading_pair, target_price)
+        return market.quantize_order_price(trading_pair, target_price)
 
     cdef set_timers(self):
         cdef double next_cycle = self._current_timestamp + self._order_refresh_time

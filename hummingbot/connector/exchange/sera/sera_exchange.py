@@ -435,6 +435,48 @@ class SeraExchange(ExchangePyBase):
         }
         return order_payload
 
+    def _signed_vl_order_payload(
+            self,
+            order_id: str,
+            trading_pair: str,
+            amount: Decimal,
+            trade_type: TradeType,
+            order_type: OrderType,
+            price: Decimal,
+            expiration: int,
+            uuid_int: str,
+    ) -> Dict[str, Any]:
+        if order_type not in [OrderType.LIMIT, OrderType.LIMIT_MAKER]:
+            raise ValueError(f"Sera supports limit orders only. Unsupported order type: {order_type}")
+        market = self._market_info[trading_pair]
+        side = CONSTANTS.SIDE_BID if trade_type is TradeType.BUY else CONSTANTS.SIDE_ASK
+        self._order_uuid_ints[order_id] = uuid_int
+        order_payload = {
+            "owner_address": self.wallet_address,
+            "side": side,
+            "amount": f"{amount:f}",
+            "price": f"{price:f}",
+            "order_type": CONSTANTS.ORDER_TYPE_LIMIT,
+            "from_address": market["base_address"],
+            "to_address": market["quote_address"],
+            "order_id": order_id,
+            "uuid_int": uuid_int,
+            "expiration": expiration,
+        }
+        signature = self.authenticator.sign_typed_data(
+            domain=self._eip712_domain,
+            message_types=CONSTANTS.ORDER_TYPES,
+            message=self._eip712_order_message(
+                market=market,
+                trade_type=trade_type,
+                amount=amount,
+                price=price,
+                expiration=expiration,
+                uuid_int=uuid_int,
+            ),
+        )
+        return {**order_payload, "signature": signature}
+
     async def _execute_vl_batch_order_create(self, orders_to_create: List[LimitOrder]):
         await self._ensure_exchange_config()
         expiration = await self._new_expiration_timestamp()
@@ -452,7 +494,7 @@ class SeraExchange(ExchangePyBase):
                     price=order.price,
                     amount=order.quantity,
                 )
-                signed_orders.append(await self._signed_order_payload(
+                signed_orders.append(self._signed_vl_order_payload(
                     order_id=order.client_order_id,
                     trading_pair=order.trading_pair,
                     amount=order.quantity,
@@ -530,10 +572,15 @@ class SeraExchange(ExchangePyBase):
     @classmethod
     def _assign_vl_order_ids(cls, orders_to_create: List[LimitOrder]) -> List[LimitOrder]:
         base_uuid_int = int(uuid.uuid4()) & ~0xffff
-        return [
-            order.copy_with_id(client_order_id=str(uuid.UUID(int=base_uuid_int | leg_id)))
-            for leg_id, order in enumerate(orders_to_create)
-        ]
+        assigned_orders = []
+        used_suffixes = set()
+        for order in orders_to_create:
+            suffix = int(uuid.uuid4()) & 0xffff
+            while suffix in used_suffixes:
+                suffix = int(uuid.uuid4()) & 0xffff
+            used_suffixes.add(suffix)
+            assigned_orders.append(order.copy_with_id(client_order_id=str(uuid.UUID(int=base_uuid_int | suffix))))
+        return assigned_orders
 
     @staticmethod
     def _encode_vl_uuid(order_id: str, executor_id: int, leg_id: int) -> str:
@@ -627,6 +674,37 @@ class SeraExchange(ExchangePyBase):
                 "Sera previewed EIP-712 quote amount mismatch: "
                 f"expected approximately {expected_raw_amount}, got {actual_raw_amount}."
             )
+
+    def _eip712_order_message(
+            self,
+            market: Dict[str, Any],
+            trade_type: TradeType,
+            amount: Decimal,
+            price: Decimal,
+            expiration: int,
+            uuid_int: str,
+    ) -> Dict[str, Any]:
+        base_raw_amount = self._decimal_to_raw_units(amount=amount, decimals=int(market["base_decimals"]))
+        quote_raw_amount = self._decimal_to_raw_units(
+            amount=amount * price, decimals=int(market["quote_decimals"])
+        )
+        from_token, to_token, from_amount, to_amount = (
+            (market["quote_address"], market["base_address"], quote_raw_amount, base_raw_amount)
+            if trade_type is TradeType.BUY
+            else (market["base_address"], market["quote_address"], base_raw_amount, quote_raw_amount)
+        )
+        return {
+            "user": self.wallet_address,
+            "expiration": expiration,
+            "feeBps": "0",
+            "recipient": CONSTANTS.ZERO_ADDRESS,
+            "fromToken": from_token,
+            "toToken": to_token,
+            "fromAmount": from_amount,
+            "toAmount": to_amount,
+            "initialDepositAmount": "0",
+            "uuid": uuid_int,
+        }
 
     @classmethod
     def _validate_eip712_domain(cls, eip712_domain: Dict[str, Any]):
