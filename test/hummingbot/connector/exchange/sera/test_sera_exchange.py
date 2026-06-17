@@ -157,6 +157,19 @@ class SeraExchangeTests(unittest.TestCase):
         self.assertEqual([self.trading_pair, self.second_trading_pair], [order.trading_pair for order in groups[0]])
         self.assertEqual([self.trading_pair], [order.trading_pair for order in groups[1]])
 
+    def test_vl_order_groups_batch_buys_with_same_quote_asset(self):
+        orders = [
+            self._limit_order(order_id="a", trading_pair="EURC-USDC", is_buy=True),
+            self._limit_order(order_id="b", trading_pair="XSGD-USDC", is_buy=True),
+            self._limit_order(order_id="c", trading_pair="EURC-SGD", is_buy=True),
+        ]
+
+        groups = self.exchange._vl_order_groups(orders)
+
+        self.assertEqual(2, len(groups))
+        self.assertEqual(["EURC-USDC", "XSGD-USDC"], [order.trading_pair for order in groups[0]])
+        self.assertEqual(["EURC-SGD"], [order.trading_pair for order in groups[1]])
+
     def test_assign_vl_order_ids_uses_rng_suffixes(self):
         orders = [
             self._limit_order(order_id="", trading_pair=self.trading_pair, is_buy=False),

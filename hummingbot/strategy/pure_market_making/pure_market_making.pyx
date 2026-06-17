@@ -1351,7 +1351,7 @@ cdef class PureMarketMakingStrategy(StrategyBase):
             object market = self._market_info.market
             list orders_to_create = []
             list created_orders = []
-            object buy, sell, order, market_info, price, tracked_market_info
+            object buy, sell, order, market_info, price, amount, tracked_market_info
             bint orders_created = False
             int buy_pair_index = 0
             int sell_pair_index = 0
@@ -1366,6 +1366,24 @@ cdef class PureMarketMakingStrategy(StrategyBase):
                 price=buy.price,
                 quantity=buy.size,
             ))
+            for trading_pair, market_info in self._vl_market_infos.items():
+                if trading_pair == self.trading_pair or market_info.quote_asset != self.quote_asset:
+                    continue
+                price = self.c_vl_order_price(trading_pair, buy.price)
+                if price is None:
+                    continue
+                amount = self.c_vl_order_amount(trading_pair, buy.size, buy.price, price)
+                if amount is None or amount <= s_decimal_zero:
+                    continue
+                orders_to_create.append(LimitOrder(
+                    client_order_id="",
+                    trading_pair=trading_pair,
+                    is_buy=True,
+                    base_currency=market_info.base_asset,
+                    quote_currency=market_info.quote_asset,
+                    price=price,
+                    quantity=amount,
+                ))
         for sell in proposal.sells:
             orders_to_create.append(LimitOrder(
                 client_order_id="",
@@ -1435,6 +1453,18 @@ cdef class PureMarketMakingStrategy(StrategyBase):
         price_multiplier = source_price / source_mid_price
         target_price = target_mid_price * price_multiplier
         return market.quantize_order_price(trading_pair, target_price)
+
+    cdef object c_vl_order_amount(self, str trading_pair, object source_amount, object source_price, object target_price):
+        cdef:
+            object market = self._market_info.market
+            object quote_amount
+            object target_amount
+
+        if target_price is None or target_price <= s_decimal_zero:
+            return None
+        quote_amount = source_amount * source_price
+        target_amount = quote_amount / target_price
+        return market.quantize_order_amount(trading_pair, target_amount)
 
     cdef set_timers(self):
         cdef double next_cycle = self._current_timestamp + self._order_refresh_time
