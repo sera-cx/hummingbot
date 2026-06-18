@@ -429,12 +429,20 @@ pure_market_making_config_map = {
                   validator=validate_bool),
     "vl_order_markets":
         ConfigVar(key="vl_order_markets",
-                  prompt="Enter the Sera trading pairs to include in sell-side VL batches "
+                  prompt="Enter the Sera trading pairs to include in VL batches "
                          "(e.g. XSGD-MYRT,XSGD-SGD) >>> ",
                   default=None,
                   required_if=lambda: pure_market_making_config_map.get("use_vl_orders").value,
                   type_str="str",
                   validator=validate_vl_order_markets),
+    "vl_triangular_enabled":
+        ConfigVar(key="vl_triangular_enabled",
+                  prompt="Do you want to enable the mixed/triangular VL model so any sibling sharing the "
+                         "base or quote asset (in either role) is mirrored on the same side? (Yes/No) >>> ",
+                  default=False,
+                  required_if=lambda: pure_market_making_config_map.get("use_vl_orders").value,
+                  type_str="bool",
+                  validator=validate_bool),
     "bid_order_level_spreads":
         ConfigVar(key="bid_order_level_spreads",
                   prompt="Enter the spreads (as percentage) for all bid spreads "

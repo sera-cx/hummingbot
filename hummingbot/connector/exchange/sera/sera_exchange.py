@@ -1,7 +1,7 @@
 import asyncio
 import time
 import uuid
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import dateutil.parser as dp
@@ -685,7 +685,12 @@ class SeraExchange(ExchangePyBase):
             uuid_int: str,
     ) -> Dict[str, Any]:
         base_raw_amount = self._decimal_to_raw_units(amount=amount, decimals=int(market["base_decimals"]))
-        quote_raw_amount = self._decimal_to_raw_units(
+        # The quote leg (amount * price) of two 6-decimal values can carry up to 12 decimals, which is
+        # never exactly representable at the quote token's precision. Truncate it the same way Sera's backend
+        # does when it reconstructs the order to verify the signature; otherwise the signed fromAmount/toAmount
+        # won't match and the batch is rejected with "Invalid signature". The base leg stays exact: amount is
+        # grid-aligned, so non-representability there is a real bug.
+        quote_raw_amount = self._decimal_to_raw_units_truncated(
             amount=amount * price, decimals=int(market["quote_decimals"])
         )
         from_token, to_token, from_amount, to_amount = (
@@ -934,6 +939,14 @@ class SeraExchange(ExchangePyBase):
         raw_amount = amount * (Decimal("10") ** decimals)
         if raw_amount != raw_amount.to_integral_value():
             raise ValueError(f"Amount {amount} is not exactly representable with {decimals} decimals.")
+        return str(int(raw_amount))
+
+    @staticmethod
+    def _decimal_to_raw_units_truncated(amount: Decimal, decimals: int) -> str:
+        # Sera's backend truncates (rounds toward zero) the quote raw amount when it reconstructs the
+        # order to verify the EIP-712 signature. The signed amount must match that reconstruction exactly
+        # — any other rounding is off by a unit and the backend rejects with "Invalid signature".
+        raw_amount = (amount * (Decimal("10") ** decimals)).to_integral_value(rounding=ROUND_DOWN)
         return str(int(raw_amount))
 
     @staticmethod

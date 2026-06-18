@@ -61,6 +61,7 @@ async def start(self):
         split_order_levels_enabled = c_map.get("split_order_levels_enabled").value
         use_vl_orders = c_map.get("use_vl_orders").value
         vl_order_markets = convert_string_to_list(c_map.get("vl_order_markets").value)
+        vl_triangular_enabled = c_map.get("vl_triangular_enabled").value
         moving_price_band = MovingPriceBand(
             enabled=c_map.get("moving_price_band_enabled").value,
             price_floor_pct=c_map.get("price_floor_pct").value,
@@ -159,6 +160,7 @@ async def start(self):
             moving_price_band=moving_price_band,
             use_vl_orders=use_vl_orders,
             vl_market_infos=vl_market_infos,
+            vl_triangular_enabled=vl_triangular_enabled,
         )
     except Exception as e:
         self.notify(str(e))

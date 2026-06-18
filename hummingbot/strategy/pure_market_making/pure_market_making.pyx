@@ -88,6 +88,7 @@ cdef class PureMarketMakingStrategy(StrategyBase):
                     moving_price_band: Optional[MovingPriceBand] = None,
                     use_vl_orders: bool = False,
                     vl_market_infos: Dict[str, MarketTradingPairTuple] = None,
+                    vl_triangular_enabled: bool = False,
                     ):
         if order_override is None:
             order_override = {}
@@ -131,6 +132,7 @@ cdef class PureMarketMakingStrategy(StrategyBase):
         self._order_override = order_override
         self._use_vl_orders = use_vl_orders
         self._vl_market_infos = {} if vl_market_infos is None else vl_market_infos
+        self._vl_triangular_enabled = vl_triangular_enabled
         self._split_order_levels_enabled=split_order_levels_enabled
         self._bid_order_level_spreads=bid_order_level_spreads
         self._ask_order_level_spreads=ask_order_level_spreads
@@ -1367,12 +1369,12 @@ cdef class PureMarketMakingStrategy(StrategyBase):
                 quantity=buy.size,
             ))
             for trading_pair, market_info in self._vl_market_infos.items():
-                if trading_pair == self.trading_pair or market_info.quote_asset != self.quote_asset:
+                if trading_pair == self.trading_pair:
                     continue
                 price = self.c_vl_order_price(trading_pair, buy.price)
                 if price is None:
                     continue
-                amount = self.c_vl_order_amount(trading_pair, buy.size, buy.price, price)
+                amount = self.c_vl_order_amount(trading_pair, market_info, buy.size, buy.price, price)
                 if amount is None or amount <= s_decimal_zero:
                     continue
                 orders_to_create.append(LimitOrder(
@@ -1400,6 +1402,9 @@ cdef class PureMarketMakingStrategy(StrategyBase):
                 price = self.c_vl_order_price(trading_pair, sell.price)
                 if price is None:
                     continue
+                amount = self.c_vl_order_amount(trading_pair, market_info, sell.size, sell.price, price)
+                if amount is None or amount <= s_decimal_zero:
+                    continue
                 orders_to_create.append(LimitOrder(
                     client_order_id="",
                     trading_pair=trading_pair,
@@ -1407,7 +1412,7 @@ cdef class PureMarketMakingStrategy(StrategyBase):
                     base_currency=market_info.base_asset,
                     quote_currency=market_info.quote_asset,
                     price=price,
-                    quantity=sell.size,
+                    quantity=amount,
                 ))
 
         if len(orders_to_create) == 0:
@@ -1454,16 +1459,34 @@ cdef class PureMarketMakingStrategy(StrategyBase):
         target_price = target_mid_price * price_multiplier
         return market.quantize_order_price(trading_pair, target_price)
 
-    cdef object c_vl_order_amount(self, str trading_pair, object source_amount, object source_price, object target_price):
+    cdef object c_vl_order_amount(self, str trading_pair, object market_info, object source_amount, object source_price, object target_price):
+        # Sizes a VL sibling order off the main-pair order. The sibling always takes the same side
+        # as the main order; the amount preserves the quantity of whichever asset it shares with the
+        # main pair. The main order moves `source_amount` of base and `source_amount * source_price`
+        # of quote.
+        # - Base model: only siblings that share the base asset (as their base) are eligible.
+        # - Triangular model: any sibling sharing the base or quote asset, in either role, is eligible.
         cdef:
             object market = self._market_info.market
-            object quote_amount
             object target_amount
-
-        if target_price is None or target_price <= s_decimal_zero:
+        if market_info.base_asset == self.base_asset:
+            # shared = main base, sits in the sibling base -> mirror the base quantity
+            target_amount = source_amount
+        elif not self._vl_triangular_enabled:
             return None
-        quote_amount = source_amount * source_price
-        target_amount = quote_amount / target_price
+        elif target_price is None or target_price <= s_decimal_zero:
+            return None
+        elif market_info.quote_asset == self.base_asset:
+            # shared = main base, sits in the sibling quote
+            target_amount = source_amount / target_price
+        elif market_info.base_asset == self.quote_asset:
+            # shared = main quote, sits in the sibling base
+            target_amount = source_amount * source_price
+        elif market_info.quote_asset == self.quote_asset:
+            # shared = main quote, sits in the sibling quote
+            target_amount = (source_amount * source_price) / target_price
+        else:
+            return None
         return market.quantize_order_amount(trading_pair, target_amount)
 
     cdef set_timers(self):

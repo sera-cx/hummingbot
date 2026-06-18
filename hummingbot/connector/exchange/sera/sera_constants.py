@@ -136,7 +136,7 @@ RATE_LIMITS = [
     RateLimit(
         limit_id=CANCEL_ORDER_PATH_URL,
         limit=READ_REQUESTS_PER_SECOND,
-        time_interval=FIVE_MINUTES,
+        time_interval=ONE_SECOND,
         linked_limits=[LinkedLimitWeightPair(TRADING_REQUEST_WEIGHT, 1)],
     ),
     RateLimit(

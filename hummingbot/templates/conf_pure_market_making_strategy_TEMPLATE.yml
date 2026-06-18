@@ -2,7 +2,7 @@
 ###       Pure market making strategy config         ###
 ########################################################
 
-template_version: 24
+template_version: 25
 strategy: null
 
 # Exchange and token parameters.
@@ -149,6 +149,10 @@ use_vl_orders: null
 
 # Sera VL order markets, comma-separated, e.g. XSGD-MYRT,XSGD-USDT
 vl_order_markets: null
+
+# Whether to enable the mixed/triangular VL model so any sibling sharing the base or quote
+# asset (in either role) is mirrored on the same side (instead of base-as-base only).
+vl_triangular_enabled: null
 
 # If the strategy should wait to receive cancellations confirmation before creating new orders during refresh time
 should_wait_order_cancel_confirmation: True

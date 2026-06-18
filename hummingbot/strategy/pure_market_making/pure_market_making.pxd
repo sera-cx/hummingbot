@@ -46,6 +46,7 @@ cdef class PureMarketMakingStrategy(StrategyBase):
         object _order_override
         bint _use_vl_orders
         object _vl_market_infos
+        bint _vl_triangular_enabled
 
         double _cancel_timestamp
         double _create_timestamp
@@ -85,6 +86,6 @@ cdef class PureMarketMakingStrategy(StrategyBase):
     cdef c_execute_orders_proposal(self, object proposal)
     cdef c_execute_orders_proposal_as_batch(self, object proposal, int number_of_pairs)
     cdef object c_vl_order_price(self, str trading_pair, object source_price)
-    cdef object c_vl_order_amount(self, str trading_pair, object source_amount, object source_price, object target_price)
+    cdef object c_vl_order_amount(self, str trading_pair, object market_info, object source_amount, object source_price, object target_price)
     cdef set_timers(self)
     cdef c_apply_moving_price_band(self, object proposal)
