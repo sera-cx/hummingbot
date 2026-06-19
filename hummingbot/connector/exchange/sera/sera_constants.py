@@ -23,6 +23,7 @@ FX_RATE_PATH_URL = "/fx/rate"
 PREVIEW_ORDER_PATH_URL = "/orders/preview"
 ORDERS_PATH_URL = "/orders"
 VL_BATCH_ORDERS_PATH_URL = "/orders/vl/batch"
+VL_CANCEL_PATH_URL = "/orders/vl/cancel"
 CANCEL_ORDER_PATH_URL = "/orders/cancel"
 ORDER_PATH_URL = "/orders/{order_id}"
 FILLS_PATH_URL = "/fills/{order_id}"
@@ -62,6 +63,15 @@ CANCEL_ORDER_TYPES = {
     "CancelOrder": [
         {"name": "owner", "type": "address"},
         {"name": "orderId", "type": "uint256"},
+    ]
+}
+
+# EIP-712 struct for cancelling a whole VL batch (POST /orders/vl/cancel). Matches the Sera external-api
+# definition (app/signature.py CANCEL_VL_BATCH_TYPES): vlBatchId is signed as the raw UUID string.
+CANCEL_VL_BATCH_TYPES = {
+    "CancelVLBatch": [
+        {"name": "owner", "type": "address"},
+        {"name": "vlBatchId", "type": "string"},
     ]
 }
 
@@ -129,6 +139,12 @@ RATE_LIMITS = [
     ),
     RateLimit(
         limit_id=VL_BATCH_ORDERS_PATH_URL,
+        limit=READ_REQUESTS_PER_SECOND,
+        time_interval=ONE_SECOND,
+        linked_limits=[LinkedLimitWeightPair(TRADING_REQUEST_WEIGHT, 1)],
+    ),
+    RateLimit(
+        limit_id=VL_CANCEL_PATH_URL,
         limit=READ_REQUESTS_PER_SECOND,
         time_interval=ONE_SECOND,
         linked_limits=[LinkedLimitWeightPair(TRADING_REQUEST_WEIGHT, 1)],

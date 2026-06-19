@@ -55,6 +55,11 @@ class SeraExchange(ExchangePyBase):
         self._market_info: Dict[str, Dict[str, Any]] = {}
         self._token_info_by_symbol: Dict[str, Dict[str, Any]] = {}
         self._order_uuid_ints: Dict[str, str] = {}
+        # Maps a tracked order (by client_order_id and exchange_order_id) to its VL batch id, captured from
+        # order-status responses. VL orders are cancelled per-batch (POST /orders/vl/cancel), not per-order.
+        self._vl_batch_id_by_order: Dict[str, str] = {}
+        # VL batch ids already cancelled this session, to avoid re-cancelling the same batch for each of its legs.
+        self._cancelled_vl_batch_ids: set = set()
         self._executor_id: Optional[int] = None
         self._eip712_domain: Optional[Dict[str, Any]] = None
         self._manual_mid_price: Dict[str, Decimal] = {}
@@ -109,7 +114,11 @@ class SeraExchange(ExchangePyBase):
 
     @property
     def is_cancel_request_in_exchange_synchronous(self) -> bool:
-        return False
+        # A successful _place_cancel means the order is gone on Sera: either the cancel POST was accepted,
+        # or it was a VL sibling already removed with its group (reported as success). Reconcile to CANCELED
+        # immediately rather than parking in PENDING_CANCEL — siblings have no independent status to poll, so
+        # waiting on the status update leaves them stuck active and blocks the create-gate / re-quoting.
+        return True
 
     @property
     def is_trading_required(self) -> bool:
@@ -730,15 +739,35 @@ class SeraExchange(ExchangePyBase):
     async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder):
         await self._ensure_exchange_config()
         exchange_order_id = await tracked_order.get_exchange_order_id()
+
+        vl_batch_id = self._vl_batch_id_by_order.get(exchange_order_id) or self._vl_batch_id_by_order.get(order_id)
         uuid_int = self._order_uuid_ints.get(exchange_order_id) or self._order_uuid_ints.get(order_id)
+
+        # VL orders cannot be cancelled one leg at a time — Sera only supports cancelling the whole batch
+        # (POST /orders/vl/cancel). The batch id is not returned at create time; it is captured from
+        # order-status responses. If we don't have it yet, fetch the order once (also backfills uuid_int).
+        if vl_batch_id is None:
+            order_status = await self._fetch_order_status_safe(exchange_order_id)
+            if order_status.get("vl_batch_id"):
+                vl_batch_id = str(order_status["vl_batch_id"])
+                self._vl_batch_id_by_order[exchange_order_id] = vl_batch_id
+            if order_status.get("uuid_int"):
+                uuid_int = str(order_status["uuid_int"])
+                self._order_uuid_ints[exchange_order_id] = uuid_int
+
+        if vl_batch_id is not None:
+            # One cancel removes every leg of the batch. Skip if we've already cancelled this batch for a
+            # sibling leg this session.
+            if vl_batch_id not in self._cancelled_vl_batch_ids:
+                await self._cancel_vl_batch(vl_batch_id)
+                self._cancelled_vl_batch_ids.add(vl_batch_id)
+                if len(self._cancelled_vl_batch_ids) > 5000:
+                    self._cancelled_vl_batch_ids.clear()
+            return True
+
+        # Regular (non-VL) single-order cancel.
         if uuid_int is None:
-            order_status = await self._api_get(
-                path_url=CONSTANTS.ORDER_PATH_URL.format(order_id=exchange_order_id),
-                is_auth_required=True,
-                limit_id=CONSTANTS.ORDER_PATH_URL,
-            )
-            uuid_int = str(order_status["uuid_int"])
-            self._order_uuid_ints[exchange_order_id] = uuid_int
+            raise IOError(f"Cannot cancel order {exchange_order_id}: uuid_int unavailable.")
         signature = self.authenticator.sign_typed_data(
             domain=self._eip712_domain,
             message_types=CONSTANTS.CANCEL_ORDER_TYPES,
@@ -757,6 +786,33 @@ class SeraExchange(ExchangePyBase):
         )
         return True
 
+    async def _fetch_order_status_safe(self, exchange_order_id: str) -> Dict[str, Any]:
+        try:
+            return await self._api_get(
+                path_url=CONSTANTS.ORDER_PATH_URL.format(order_id=exchange_order_id),
+                is_auth_required=True,
+                limit_id=CONSTANTS.ORDER_PATH_URL,
+            )
+        except IOError:
+            return {}
+
+    async def _cancel_vl_batch(self, vl_batch_id: str):
+        signature = self.authenticator.sign_typed_data(
+            domain=self._eip712_domain,
+            message_types=CONSTANTS.CANCEL_VL_BATCH_TYPES,
+            message={"owner": self.wallet_address, "vlBatchId": vl_batch_id},
+        )
+        await self._api_post(
+            path_url=CONSTANTS.VL_CANCEL_PATH_URL,
+            data={
+                "owner_address": self.wallet_address,
+                "vl_batch_id": vl_batch_id,
+                "signature": signature,
+            },
+            is_auth_required=False,
+            limit_id=CONSTANTS.VL_CANCEL_PATH_URL,
+        )
+
     async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
         order_data = await self._request_order_status_data(tracked_order=tracked_order)
         return self._order_update_from_order_data(tracked_order=tracked_order, order_data=order_data)
@@ -770,6 +826,8 @@ class SeraExchange(ExchangePyBase):
         )
         if order_data.get("uuid_int"):
             self._order_uuid_ints[exchange_order_id] = str(order_data["uuid_int"])
+        if order_data.get("vl_batch_id"):
+            self._vl_batch_id_by_order[exchange_order_id] = str(order_data["vl_batch_id"])
         return order_data
 
     def _order_update_from_order_data(self, tracked_order: InFlightOrder, order_data: Dict[str, Any]) -> OrderUpdate:
