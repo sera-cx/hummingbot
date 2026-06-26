@@ -152,6 +152,27 @@ class PMMRefreshToleranceUnitTest(unittest.TestCase):
         self.assertEqual(old_ask, new_ask)
         self.assertEqual(old_bid, new_bid)
 
+    def test_refresh_tolerance_extends_cancel_timer_when_orders_are_unchanged(self):
+        strategy = self.one_level_strategy
+        self.clock.add_iterator(strategy)
+        self.clock.backtest_til(self.start_timestamp + self.clock_tick_size)
+        old_bid = strategy.active_buys[0]
+        old_ask = strategy.active_sells[0]
+
+        self.clock.backtest_til(self.start_timestamp + 6 * self.clock_tick_size)
+        self.assertEqual(old_bid.client_order_id, strategy.active_buys[0].client_order_id)
+        self.assertEqual(old_ask.client_order_id, strategy.active_sells[0].client_order_id)
+
+        self.market.order_books[self.trading_pair].apply_diffs([OrderBookRow(99.5, 30, 2)],
+                                                               [OrderBookRow(100.1, 30, 2)], 2)
+        self.clock.backtest_til(self.start_timestamp + 8 * self.clock_tick_size)
+        self.assertEqual(old_bid.client_order_id, strategy.active_buys[0].client_order_id)
+        self.assertEqual(old_ask.client_order_id, strategy.active_sells[0].client_order_id)
+
+        self.clock.backtest_til(self.start_timestamp + 11 * self.clock_tick_size)
+        self.assertNotEqual(old_bid.client_order_id, strategy.active_buys[0].client_order_id)
+        self.assertNotEqual(old_ask.client_order_id, strategy.active_sells[0].client_order_id)
+
     def test_multi_levels_active_orders_are_cancelled_when_mid_price_moves(self):
         strategy = self.multi_levels_strategy
         self.clock.add_iterator(strategy)

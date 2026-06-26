@@ -11,12 +11,13 @@ from hummingbot.client.config.config_helpers import ClientConfigAdapter
 from hummingbot.connector.exchange.paper_trade.paper_trade_exchange import QuantizationParams
 from hummingbot.connector.test_support.mock_paper_exchange import MockPaperExchange
 from hummingbot.core.clock import Clock, ClockMode
-from hummingbot.core.data_type.common import PriceType, TradeType
+from hummingbot.core.data_type.common import OrderType, PriceType, TradeType
 from hummingbot.core.data_type.limit_order import LimitOrder
 from hummingbot.core.data_type.order_book import OrderBook
 from hummingbot.core.data_type.order_book_row import OrderBookRow
+from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee
 from hummingbot.core.event.event_logger import EventLogger
-from hummingbot.core.event.events import MarketEvent, OrderBookTradeEvent, OrderCancelledEvent
+from hummingbot.core.event.events import MarketEvent, OrderBookTradeEvent, OrderCancelledEvent, OrderFilledEvent
 from hummingbot.model.sql_connection_manager import SQLConnectionManager, SQLConnectionType
 from hummingbot.strategy.market_trading_pair_tuple import MarketTradingPairTuple
 from hummingbot.strategy.order_book_asset_price_delegate import OrderBookAssetPriceDelegate
@@ -580,12 +581,53 @@ class PMMUnitTest(unittest.TestCase):
         self.assertEqual(1, len(strategy.active_buys))
         self.assertEqual(1, len(strategy.active_sells))
 
-        # Prices are not adjusted according to filled price as per settings
-        self.assertEqual(Decimal("99"), strategy.active_buys[0].price)
+        # Rebalance order is placed at mid price; regular side keeps spread price.
+        self.assertEqual(Decimal("100"), strategy.active_buys[0].price)
         self.assertEqual(Decimal("101"), strategy.active_sells[0].price)
-        self.assertEqual(Decimal("1.0"), strategy.active_buys[0].quantity)
+        self.assertEqual(Decimal("2.0"), strategy.active_buys[0].quantity)
         self.assertEqual(Decimal("1.0"), strategy.active_sells[0].quantity)
         self.order_fill_logger.clear()
+
+    def test_filled_buy_increases_next_ask_size(self):
+        strategy = self.one_level_strategy
+        strategy.filled_order_delay = 5.0
+        self.clock.add_iterator(strategy)
+        self.clock.backtest_til(self.start_timestamp + 1)
+
+        self.simulate_maker_market_trade(False, Decimal("100"), Decimal("98.9"))
+        self.clock.backtest_til(self.start_timestamp + 8)
+
+        self.assertEqual(Decimal("99"), strategy.active_buys[0].price)
+        self.assertEqual(Decimal("100"), strategy.active_sells[0].price)
+        self.assertEqual(Decimal("1.0"), strategy.active_buys[0].quantity)
+        self.assertEqual(Decimal("2.0"), strategy.active_sells[0].quantity)
+
+    def test_partial_filled_sell_increases_next_bid_size(self):
+        strategy = self.one_level_strategy
+        strategy.filled_order_delay = 5.0
+        self.clock.add_iterator(strategy)
+        self.clock.backtest_til(self.start_timestamp + 1)
+
+        ask_order = strategy.active_sells[0]
+        self.market.trigger_event(
+            MarketEvent.OrderFilled,
+            OrderFilledEvent(
+                timestamp=self.clock.current_timestamp,
+                order_id=ask_order.client_order_id,
+                trading_pair=self.trading_pair,
+                trade_type=TradeType.SELL,
+                order_type=OrderType.LIMIT,
+                price=ask_order.price,
+                amount=Decimal("0.4"),
+                trade_fee=AddedToCostTradeFee(),
+            ),
+        )
+        self.clock.backtest_til(self.start_timestamp + 8)
+
+        self.assertEqual(Decimal("100"), strategy.active_buys[0].price)
+        self.assertEqual(Decimal("101"), strategy.active_sells[0].price)
+        self.assertEqual(Decimal("1.4"), strategy.active_buys[0].quantity)
+        self.assertEqual(Decimal("1.0"), strategy.active_sells[0].quantity)
 
     def test_filled_order_delay_mulitiple_orders(self):
         strategy = self.multi_levels_strategy

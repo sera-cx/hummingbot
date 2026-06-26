@@ -25,7 +25,7 @@ from .data_types import PriceSize, Proposal
 from .inventory_cost_price_delegate import InventoryCostPriceDelegate
 from .inventory_skew_calculator cimport c_calculate_bid_ask_ratios_from_base_asset_ratio
 from .inventory_skew_calculator import calculate_total_order_size
-from .pure_market_making_order_tracker import PureMarketMakingOrderTracker
+from .sera_market_making_order_tracker import SeraMarketMakingOrderTracker
 from .moving_price_band import MovingPriceBand
 
 
@@ -35,7 +35,7 @@ s_decimal_neg_one = Decimal(-1)
 pmm_logger = None
 
 
-cdef class PureMarketMakingStrategy(StrategyBase):
+cdef class SeraMarketMakingStrategy(StrategyBase):
     OPTION_LOG_CREATE_ORDER = 1 << 3
     OPTION_LOG_MAKER_ORDER_FILLED = 1 << 4
     OPTION_LOG_STATUS_REPORT = 1 << 5
@@ -96,7 +96,7 @@ cdef class PureMarketMakingStrategy(StrategyBase):
             moving_price_band = MovingPriceBand()
         if price_ceiling != s_decimal_neg_one and price_ceiling < price_floor:
             raise ValueError("Parameter price_ceiling cannot be lower than price_floor.")
-        self._sb_order_tracker = PureMarketMakingOrderTracker()
+        self._sb_order_tracker = SeraMarketMakingOrderTracker()
         self._market_info = market_info
         self._bid_spread = bid_spread
         self._ask_spread = ask_spread

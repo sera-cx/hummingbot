@@ -31,6 +31,7 @@ from hummingbot.core.rate_oracle.sources.kucoin_rate_source import KucoinRateSou
 from hummingbot.core.rate_oracle.sources.mexc_rate_source import MexcRateSource
 from hummingbot.core.rate_oracle.sources.pacifica_perpetual_rate_source import PacificaPerpetualRateSource
 from hummingbot.core.rate_oracle.sources.rate_source_base import RateSourceBase
+from hummingbot.core.rate_oracle.sources.wise_rate_source import WiseRateSource
 from hummingbot.core.rate_oracle.utils import find_rate
 from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.logger import HummingbotLogger
@@ -54,6 +55,7 @@ RATE_ORACLE_SOURCES = {
     "evedex_perpetual": EvedexPerpetualRateSource,
     "pacifica_perpetual": PacificaPerpetualRateSource,
     "decibel_perpetual": DecibelPerpetualRateSource,
+    "wise": WiseRateSource,
 }
 
 
@@ -205,27 +207,32 @@ class RateOracle(NetworkBase):
         :param base_token: The token symbol that we want to price, e.g. BTC
         :return A conversion rate
         """
-        prices = await self._source.get_prices(quote_token=self._quote_token)
         pair = combine_to_hb_trading_pair(base=base_token, quote=self._quote_token)
+        if hasattr(self._source, "get_prices_for_pairs"):
+            prices = await self._source.get_prices_for_pairs([pair])
+        else:
+            prices = await self._source.get_prices(quote_token=self._quote_token)
         return find_rate(prices, pair)
 
-    def get_pair_rate(self, pair: str) -> Optional[Decimal]:
+    def get_pair_rate(self, pair: str, include_connector_rates: bool = True) -> Optional[Decimal]:
         """
         Finds a conversion rate for a given trading pair. The lookup tries, in order:
           1. the configured rate source cache (direct pair)
-          2. registered connectors' live order books (direct and reverse pair)
+          2. registered connectors' live order books (direct and reverse pair), when enabled
           3. the configured rate source cache (reverse pair, inverted)
         Returns ``None`` when no rate can be resolved.
 
         :param pair: A trading pair, e.g. BTC-USDT
+        :param include_connector_rates: Whether registered live connector order books can be used as a fallback.
         :return A conversion rate, or ``None`` if no rate is available
         """
         rate = find_rate(self._prices, pair)
         if rate is not None and rate > Decimal("0"):
             return rate
-        connector_rate = self._get_rate_from_connectors(pair)
-        if connector_rate is not None:
-            return connector_rate
+        if include_connector_rates:
+            connector_rate = self._get_rate_from_connectors(pair)
+            if connector_rate is not None:
+                return connector_rate
         base, quote = split_hb_trading_pair(pair)
         reverse_pair = combine_to_hb_trading_pair(base=quote, quote=base)
         reverse_rate = find_rate(self._prices, reverse_pair)
@@ -256,7 +263,10 @@ class RateOracle(NetworkBase):
         :param pair: A trading pair, e.g. BTC-USDT
         :return A conversion rate
         """
-        prices = await self._source.get_prices(quote_token=self._quote_token)
+        if hasattr(self._source, "get_prices_for_pairs"):
+            prices = await self._source.get_prices_for_pairs([pair])
+        else:
+            prices = await self._source.get_prices(quote_token=self._quote_token)
         return find_rate(prices, pair)
 
     def set_price(self, pair: str, price: Decimal):

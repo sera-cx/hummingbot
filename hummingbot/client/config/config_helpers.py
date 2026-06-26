@@ -894,6 +894,8 @@ def default_strategy_file_path(strategy: str) -> str:
 def short_strategy_name(strategy: str) -> str:
     if strategy == "pure_market_making":
         return "pure_mm"
+    elif strategy == "sera_market_making":
+        return "sera_mm"
     elif strategy == "cross_exchange_market_making":
         return "xemm"
     elif strategy == "arbitrage":

@@ -25,6 +25,7 @@ from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.model.inventory_cost import InventoryCost
 from hummingbot.strategy.perpetual_market_making import PerpetualMarketMakingStrategy
 from hummingbot.strategy.pure_market_making import PureMarketMakingStrategy
+from hummingbot.strategy.sera_market_making import SeraMarketMakingStrategy
 from hummingbot.user.user_balances import UserBalances
 
 if TYPE_CHECKING:
@@ -317,6 +318,7 @@ class ConfigCommand:
             self.notify(f"{config.key}: {str(config.value)}")
         if (
                 isinstance(self.trading_core.strategy, PureMarketMakingStrategy) or
+                isinstance(self.trading_core.strategy, SeraMarketMakingStrategy) or
                 isinstance(self.trading_core.strategy, PerpetualMarketMakingStrategy)
         ):
             updated = ConfigCommand.update_running_mm(self.trading_core.strategy, key, config_var.value)

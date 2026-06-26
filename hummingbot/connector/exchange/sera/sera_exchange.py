@@ -1,0 +1,1057 @@
+import asyncio
+import time
+import uuid
+from decimal import ROUND_DOWN, Decimal
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+import dateutil.parser as dp
+from bidict import bidict
+
+from hummingbot.connector.constants import s_decimal_NaN
+from hummingbot.connector.exchange.sera import sera_constants as CONSTANTS, sera_utils, sera_web_utils as web_utils
+from hummingbot.connector.exchange.sera.sera_api_order_book_data_source import SeraAPIOrderBookDataSource
+from hummingbot.connector.exchange.sera.sera_api_user_stream_data_source import SeraAPIUserStreamDataSource
+from hummingbot.connector.exchange.sera.sera_auth import SeraAuth
+from hummingbot.connector.exchange_py_base import ExchangePyBase
+from hummingbot.connector.trading_rule import TradingRule
+from hummingbot.connector.utils import combine_to_hb_trading_pair, split_hb_trading_pair
+from hummingbot.core.data_type.common import OrderType, PriceType, TradeType
+from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, OrderUpdate, TradeUpdate
+from hummingbot.core.data_type.limit_order import LimitOrder
+from hummingbot.core.data_type.market_order import MarketOrder
+from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
+from hummingbot.core.data_type.trade_fee import TokenAmount, TradeFeeBase
+from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
+from hummingbot.core.rate_oracle.rate_oracle import RateOracle
+from hummingbot.core.utils.async_utils import safe_ensure_future
+from hummingbot.core.utils.estimate_fee import build_trade_fee
+from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
+
+
+class SeraExchange(ExchangePyBase):
+    UPDATE_ORDER_STATUS_MIN_INTERVAL = 10.0
+
+    web_utils = web_utils
+
+    def __init__(
+            self,
+            sera_api_key: str,
+            sera_api_secret: str,
+            sera_wallet_address: str,
+            sera_wallet_private_key: str,
+            balance_asset_limit: Optional[Dict[str, Dict[str, Decimal]]] = None,
+            rate_limits_share_pct: Decimal = Decimal("100"),
+            trading_pairs: Optional[List[str]] = None,
+            trading_required: bool = True,
+            domain: str = CONSTANTS.DEFAULT_DOMAIN,
+    ):
+        self.api_key = sera_api_key
+        self.api_secret = sera_api_secret
+        self.wallet_address = sera_wallet_address.lower() if sera_wallet_address else None
+        self.private_key = sera_wallet_private_key
+        self._domain = domain
+        self._trading_required = trading_required
+        self._trading_pairs = trading_pairs or []
+        self._market_info: Dict[str, Dict[str, Any]] = {}
+        self._token_info_by_symbol: Dict[str, Dict[str, Any]] = {}
+        self._order_uuid_ints: Dict[str, str] = {}
+        # Maps a tracked order (by client_order_id and exchange_order_id) to its VL batch id, captured from
+        # order-status responses. VL orders are cancelled per-batch (POST /orders/vl/cancel), not per-order.
+        self._vl_batch_id_by_order: Dict[str, str] = {}
+        # VL batch ids already cancelled this session, to avoid re-cancelling the same batch for each of its legs.
+        self._cancelled_vl_batch_ids: set = set()
+        self._executor_id: Optional[int] = None
+        self._eip712_domain: Optional[Dict[str, Any]] = None
+        self._manual_mid_price: Dict[str, Decimal] = {}
+        self._last_oracle_mid_price_log: Dict[str, float] = {}
+        self._last_status_log_timestamp: float = 0
+        super().__init__(balance_asset_limit, rate_limits_share_pct)
+
+    @property
+    def authenticator(self) -> SeraAuth:
+        return SeraAuth(
+            api_key=self.api_key,
+            api_secret=self.api_secret,
+            wallet_address=self.wallet_address,
+            private_key=self.private_key,
+        )
+
+    @property
+    def name(self) -> str:
+        return "sera"
+
+    @property
+    def rate_limits_rules(self):
+        return CONSTANTS.RATE_LIMITS
+
+    @property
+    def domain(self) -> str:
+        return self._domain
+
+    @property
+    def client_order_id_max_length(self) -> int:
+        return CONSTANTS.MAX_ORDER_ID_LEN
+
+    @property
+    def client_order_id_prefix(self) -> str:
+        return CONSTANTS.HBOT_ORDER_ID_PREFIX
+
+    @property
+    def trading_rules_request_path(self) -> str:
+        return CONSTANTS.MARKETS_PATH_URL
+
+    @property
+    def trading_pairs_request_path(self) -> str:
+        return CONSTANTS.MARKETS_PATH_URL
+
+    @property
+    def check_network_request_path(self) -> str:
+        return CONSTANTS.HEALTH_PATH_URL
+
+    @property
+    def trading_pairs(self) -> List[str]:
+        return self._trading_pairs
+
+    @property
+    def is_cancel_request_in_exchange_synchronous(self) -> bool:
+        # A successful _place_cancel means the order is gone on Sera: either the cancel POST was accepted,
+        # or it was a VL sibling already removed with its group (reported as success). Reconcile to CANCELED
+        # immediately rather than parking in PENDING_CANCEL — siblings have no independent status to poll, so
+        # waiting on the status update leaves them stuck active and blocks the create-gate / re-quoting.
+        return True
+
+    @property
+    def is_trading_required(self) -> bool:
+        return self._trading_required
+
+    @property
+    def status_dict(self) -> Dict[str, bool]:
+        status = super().status_dict
+        status["user_stream_initialized"] = True
+        if not all(status.values()):
+            now = time.time()
+            if now - self._last_status_log_timestamp >= 10:
+                self._last_status_log_timestamp = now
+                not_ready = [key for key, value in status.items() if not value]
+                self.logger().info(f"Sera connector is not ready; waiting for: {', '.join(not_ready)}.")
+        return status
+
+    def set_manual_mid_price(self, trading_pair: str, price: Optional[Decimal]):
+        if price is None or (hasattr(price, "is_nan") and price.is_nan()):
+            self._manual_mid_price.pop(trading_pair, None)
+        else:
+            self._manual_mid_price[trading_pair] = Decimal(str(price))
+
+    def set_mid_price_from_price_oracle(self, trading_pair: str) -> Optional[Decimal]:
+        oracle_price = self._get_oracle_mid_price(trading_pair)
+        if oracle_price is not None:
+            self.set_manual_mid_price(trading_pair, oracle_price)
+        return oracle_price
+
+    def get_mid_price(self, trading_pair: str) -> Decimal:
+        if trading_pair in self._manual_mid_price:
+            return self._manual_mid_price[trading_pair]
+        order_book_mid_price = self._get_order_book_mid_price(trading_pair)
+        if self._is_invalid_price(order_book_mid_price):
+            oracle_price = self._get_oracle_mid_price(trading_pair)
+            self._log_oracle_mid_price_fallback(trading_pair, oracle_price)
+            return oracle_price or s_decimal_NaN
+        return order_book_mid_price
+
+    def get_price_by_type(self, trading_pair: str, price_type: PriceType) -> Decimal:
+        if price_type == PriceType.MidPrice:
+            return self.get_mid_price(trading_pair)
+        if price_type == PriceType.BestBid:
+            return self._get_order_book_top_price(trading_pair, False)
+        if price_type == PriceType.BestAsk:
+            return self._get_order_book_top_price(trading_pair, True)
+        price = super().get_price_by_type(trading_pair, price_type)
+        return price
+
+    @staticmethod
+    def _is_invalid_price(price: Decimal) -> bool:
+        return price is None or (hasattr(price, "is_nan") and price.is_nan()) or price <= Decimal("0")
+
+    def _get_order_book_mid_price(self, trading_pair: str) -> Decimal:
+        order_book = self.order_books.get(trading_pair)
+        if order_book is None:
+            return s_decimal_NaN
+        try:
+            best_ask = Decimal(str(order_book.get_price(True)))
+            best_bid = Decimal(str(order_book.get_price(False)))
+        except OSError:
+            return s_decimal_NaN
+        if self._is_invalid_price(best_ask) or self._is_invalid_price(best_bid):
+            return s_decimal_NaN
+        return (best_ask + best_bid) / Decimal("2")
+
+    def _get_order_book_top_price(self, trading_pair: str, is_buy: bool) -> Decimal:
+        order_book = self.order_books.get(trading_pair)
+        if order_book is None:
+            return s_decimal_NaN
+        try:
+            top_price = Decimal(str(order_book.get_price(is_buy)))
+        except OSError:
+            return s_decimal_NaN
+        if self._is_invalid_price(top_price):
+            return s_decimal_NaN
+        return self.quantize_order_price(trading_pair, top_price)
+
+    def _log_oracle_mid_price_fallback(self, trading_pair: str, oracle_price: Optional[Decimal]):
+        now = time.time()
+        last_log_timestamp = self._last_oracle_mid_price_log.get(trading_pair, 0)
+        if now - last_log_timestamp < 30:
+            return
+        self._last_oracle_mid_price_log[trading_pair] = now
+        if oracle_price is None:
+            self.logger().info(f"Order book is empty for {trading_pair}; oracle mid price is not available yet.")
+        else:
+            self.logger().info(f"Order book is empty for {trading_pair}; using oracle mid price {oracle_price}.")
+
+    @staticmethod
+    def _get_oracle_mid_price(trading_pair: str) -> Optional[Decimal]:
+        oracle_price = RateOracle.get_instance().get_pair_rate(trading_pair, include_connector_rates=False)
+        if oracle_price is not None and oracle_price > Decimal("0"):
+            return oracle_price
+        return None
+
+    def supported_order_types(self):
+        return [OrderType.LIMIT, OrderType.LIMIT_MAKER]
+
+    def buy(
+            self,
+            trading_pair: str,
+            amount: Decimal,
+            order_type=OrderType.LIMIT,
+            price: Decimal = s_decimal_NaN,
+            **kwargs,
+    ) -> str:
+        order_id = str(uuid.uuid4())
+        safe_ensure_future(self._create_order(
+            trade_type=TradeType.BUY,
+            order_id=order_id,
+            trading_pair=trading_pair,
+            amount=amount,
+            order_type=order_type,
+            price=price,
+            **kwargs,
+        ))
+        return order_id
+
+    def sell(
+            self,
+            trading_pair: str,
+            amount: Decimal,
+            order_type: OrderType = OrderType.LIMIT,
+            price: Decimal = s_decimal_NaN,
+            **kwargs,
+    ) -> str:
+        order_id = str(uuid.uuid4())
+        safe_ensure_future(self._create_order(
+            trade_type=TradeType.SELL,
+            order_id=order_id,
+            trading_pair=trading_pair,
+            amount=amount,
+            order_type=order_type,
+            price=price,
+            **kwargs,
+        ))
+        return order_id
+
+    def batch_order_create(self, orders_to_create: List[Union[LimitOrder, MarketOrder]]) -> List[Union[LimitOrder, MarketOrder]]:
+        limit_orders = [order for order in orders_to_create if isinstance(order, LimitOrder)]
+        if len(limit_orders) != len(orders_to_create):
+            return super().batch_order_create(orders_to_create)
+
+        created_orders = []
+        for orders_group in self._vl_order_groups(limit_orders):
+            if len(orders_group) < 2:
+                created_orders.extend(super().batch_order_create(orders_group))
+            else:
+                orders_with_ids = self._assign_vl_order_ids(orders_group)
+                created_orders.extend(orders_with_ids)
+                safe_ensure_future(self._execute_vl_batch_order_create(orders_to_create=orders_with_ids))
+        return created_orders
+
+    def _get_fee(
+            self,
+            base_currency: str,
+            quote_currency: str,
+            order_type: OrderType,
+            order_side: TradeType,
+            amount: Decimal,
+            price: Decimal = s_decimal_NaN,
+            is_maker: Optional[bool] = None,
+    ) -> TradeFeeBase:
+        is_maker = order_type is OrderType.LIMIT_MAKER if is_maker is None else is_maker
+        return build_trade_fee(
+            exchange=self.name,
+            is_maker=is_maker,
+            order_side=order_side,
+            order_type=order_type,
+            amount=amount,
+            price=price,
+            base_currency=base_currency.upper(),
+            quote_currency=quote_currency.upper(),
+        )
+
+    def _is_request_exception_related_to_time_synchronizer(self, request_exception: Exception) -> bool:
+        return False
+
+    def _is_order_not_found_during_status_update_error(self, status_update_exception: Exception) -> bool:
+        return "404" in str(status_update_exception)
+
+    def _is_order_not_found_during_cancelation_error(self, cancelation_exception: Exception) -> bool:
+        return "404" in str(cancelation_exception)
+
+    def _create_web_assistants_factory(self) -> WebAssistantsFactory:
+        return web_utils.build_api_factory(
+            throttler=self._throttler,
+            time_synchronizer=self._time_synchronizer,
+            domain=self._domain,
+            auth=self._auth,
+        )
+
+    def _create_order_book_data_source(self) -> OrderBookTrackerDataSource:
+        return SeraAPIOrderBookDataSource(trading_pairs=self._trading_pairs, connector=self)
+
+    def _create_user_stream_data_source(self) -> UserStreamTrackerDataSource:
+        return SeraAPIUserStreamDataSource()
+
+    async def _make_network_check_request(self):
+        await self._api_get(path_url=self.check_network_request_path, limit_id=CONSTANTS.HEALTH_PATH_URL)
+
+    async def _make_trading_rules_request(self) -> Any:
+        return await self._api_get(path_url=self.trading_rules_request_path, limit_id=CONSTANTS.MARKETS_PATH_URL)
+
+    async def _make_trading_pairs_request(self) -> Any:
+        return await self._api_get(path_url=self.trading_pairs_request_path, limit_id=CONSTANTS.MARKETS_PATH_URL)
+
+    async def _format_trading_rules(self, exchange_info_dict: Dict[str, Any]) -> List[TradingRule]:
+        rules = []
+        markets = exchange_info_dict.get("markets", exchange_info_dict)
+        for market in filter(sera_utils.is_exchange_information_valid, markets):
+            try:
+                trading_pair = self._trading_pair_from_market(market=market)
+                amount_step = Decimal(str(market["amount_step"]))
+                price_step = Decimal(str(market["price_step"]))
+                min_order_size = Decimal(str(market.get("min_ask_amount") or "0"))
+                if min_order_size == Decimal("0"):
+                    min_order_size = amount_step
+                rules.append(TradingRule(
+                    trading_pair=trading_pair,
+                    min_order_size=min_order_size,
+                    min_price_increment=price_step,
+                    min_base_amount_increment=amount_step,
+                    min_notional_size=Decimal(str(market.get("min_bid_quote_amount") or "0")),
+                ))
+                self._market_info[trading_pair] = market
+            except Exception:
+                self.logger().exception(f"Error parsing Sera trading rule {market}. Skipping.")
+        return rules
+
+    def _initialize_trading_pair_symbols_from_exchange_info(self, exchange_info: Dict[str, Any]):
+        mapping = bidict()
+        markets = exchange_info.get("markets", exchange_info)
+        for market in filter(sera_utils.is_exchange_information_valid, markets):
+            mapping[market["symbol"]] = self._trading_pair_from_market(market=market)
+        self._set_trading_pair_symbol_map(mapping)
+
+    async def _place_order(
+            self,
+            order_id: str,
+            trading_pair: str,
+            amount: Decimal,
+            trade_type: TradeType,
+            order_type: OrderType,
+            price: Decimal,
+            **kwargs,
+    ) -> Tuple[str, float]:
+        order_payload = await self._signed_order_payload(
+            order_id=order_id,
+            trading_pair=trading_pair,
+            amount=amount,
+            trade_type=trade_type,
+            order_type=order_type,
+            price=price,
+            expiration=kwargs.get("expiration"),
+        )
+        order_result = await self._api_post(
+            path_url=CONSTANTS.ORDERS_PATH_URL,
+            data=order_payload,
+            is_auth_required=False,
+            limit_id=CONSTANTS.ORDERS_PATH_URL,
+        )
+        return str(order_result["order_id"]), self.current_timestamp
+
+    async def _signed_order_payload(
+            self,
+            order_id: str,
+            trading_pair: str,
+            amount: Decimal,
+            trade_type: TradeType,
+            order_type: OrderType,
+            price: Decimal,
+            expiration: Optional[int] = None,
+            uuid_int: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        if order_type not in [OrderType.LIMIT, OrderType.LIMIT_MAKER]:
+            raise ValueError(f"Sera supports limit orders only. Unsupported order type: {order_type}")
+        await self._ensure_exchange_config()
+        market = self._market_info[trading_pair]
+        side = CONSTANTS.SIDE_BID if trade_type is TradeType.BUY else CONSTANTS.SIDE_ASK
+        expiration = expiration or await self._new_expiration_timestamp()
+        uuid_int = uuid_int or self._encode_standalone_uuid(order_id=order_id, executor_id=self._executor_id)
+        self._order_uuid_ints[order_id] = uuid_int
+        preview_payload = {
+            "owner_address": self.wallet_address,
+            "side": side,
+            "amount": f"{amount:f}",
+            "price": f"{price:f}",
+            "order_type": CONSTANTS.ORDER_TYPE_LIMIT,
+            "from_address": market["base_address"],
+            "to_address": market["quote_address"],
+            "order_id": order_id,
+            "uuid_int": uuid_int,
+            "expiration": expiration,
+        }
+        preview = await self._api_post(
+            path_url=CONSTANTS.PREVIEW_ORDER_PATH_URL,
+            data=preview_payload,
+            is_auth_required=False,
+            limit_id=CONSTANTS.PREVIEW_ORDER_PATH_URL,
+        )
+        eip712_order = preview["eip712_order"]
+        self._validate_eip712_domain(preview.get("eip712_domain") or self._eip712_domain)
+        self._validate_previewed_eip712_order(
+            preview_payload=preview_payload,
+            preview=preview,
+            market=market,
+            trade_type=trade_type,
+            amount=amount,
+            price=price,
+        )
+        signature = self.authenticator.sign_typed_data(
+            domain=self._eip712_domain,
+            message_types=preview.get("eip712_types") or CONSTANTS.ORDER_TYPES,
+            message=eip712_order,
+        )
+        order_payload = {
+            **preview_payload,
+            "amount": preview.get("normalized_amount", preview_payload["amount"]),
+            "price": preview.get("normalized_price", preview_payload["price"]),
+            "signature": signature,
+        }
+        return order_payload
+
+    def _signed_vl_order_payload(
+            self,
+            order_id: str,
+            trading_pair: str,
+            amount: Decimal,
+            trade_type: TradeType,
+            order_type: OrderType,
+            price: Decimal,
+            expiration: int,
+            uuid_int: str,
+    ) -> Dict[str, Any]:
+        if order_type not in [OrderType.LIMIT, OrderType.LIMIT_MAKER]:
+            raise ValueError(f"Sera supports limit orders only. Unsupported order type: {order_type}")
+        market = self._market_info[trading_pair]
+        side = CONSTANTS.SIDE_BID if trade_type is TradeType.BUY else CONSTANTS.SIDE_ASK
+        self._order_uuid_ints[order_id] = uuid_int
+        order_payload = {
+            "owner_address": self.wallet_address,
+            "side": side,
+            "amount": f"{amount:f}",
+            "price": f"{price:f}",
+            "order_type": CONSTANTS.ORDER_TYPE_LIMIT,
+            "from_address": market["base_address"],
+            "to_address": market["quote_address"],
+            "order_id": order_id,
+            "uuid_int": uuid_int,
+            "expiration": expiration,
+        }
+        signature = self.authenticator.sign_typed_data(
+            domain=self._eip712_domain,
+            message_types=CONSTANTS.ORDER_TYPES,
+            message=self._eip712_order_message(
+                market=market,
+                trade_type=trade_type,
+                amount=amount,
+                price=price,
+                expiration=expiration,
+                uuid_int=uuid_int,
+            ),
+        )
+        return {**order_payload, "signature": signature}
+
+    async def _execute_vl_batch_order_create(self, orders_to_create: List[LimitOrder]):
+        await self._ensure_exchange_config()
+        expiration = await self._new_expiration_timestamp()
+        signed_orders = []
+        try:
+            for leg_id, order in enumerate(orders_to_create):
+                trade_type = TradeType.BUY if order.is_buy else TradeType.SELL
+                uuid_int = self._encode_vl_uuid(order_id=order.client_order_id, executor_id=self._executor_id, leg_id=leg_id)
+                self.start_tracking_order(
+                    order_id=order.client_order_id,
+                    exchange_order_id=None,
+                    trading_pair=order.trading_pair,
+                    order_type=OrderType.LIMIT,
+                    trade_type=trade_type,
+                    price=order.price,
+                    amount=order.quantity,
+                )
+                signed_orders.append(self._signed_vl_order_payload(
+                    order_id=order.client_order_id,
+                    trading_pair=order.trading_pair,
+                    amount=order.quantity,
+                    trade_type=trade_type,
+                    order_type=OrderType.LIMIT,
+                    price=order.price,
+                    expiration=expiration,
+                    uuid_int=uuid_int,
+                ))
+            order_result = await self._api_post(
+                path_url=CONSTANTS.VL_BATCH_ORDERS_PATH_URL,
+                data={"orders": signed_orders},
+                is_auth_required=False,
+                limit_id=CONSTANTS.VL_BATCH_ORDERS_PATH_URL,
+            )
+            cancelled_orders = order_result.get("cancelled", []) if isinstance(order_result, dict) else []
+            cancelled_order_ids = {
+                str(cancelled.get("order_id"))
+                for cancelled in cancelled_orders
+                if isinstance(cancelled, dict) and cancelled.get("order_id") is not None
+            }
+            for order_id in self._order_ids_from_vl_batch_result(order_result):
+                order = self._order_tracker.fetch_tracked_order(str(order_id))
+                if order is None:
+                    continue
+                self._order_tracker.process_order_update(OrderUpdate(
+                    client_order_id=order.client_order_id,
+                    exchange_order_id=str(order_id),
+                    trading_pair=order.trading_pair,
+                    update_timestamp=self.current_timestamp,
+                    new_state=OrderState.CANCELED if str(order_id) in cancelled_order_ids else OrderState.OPEN,
+                ))
+        except asyncio.CancelledError:
+            raise
+        except Exception as ex:
+            for order in orders_to_create:
+                self._on_order_failure(
+                    order_id=order.client_order_id,
+                    trading_pair=order.trading_pair,
+                    amount=order.quantity,
+                    trade_type=TradeType.BUY if order.is_buy else TradeType.SELL,
+                    order_type=OrderType.LIMIT,
+                    price=order.price,
+                    exception=ex,
+                )
+
+    @classmethod
+    def _vl_order_groups(cls, orders_to_create: List[LimitOrder]) -> List[List[LimitOrder]]:
+        groups = []
+        grouped_orders = {}
+        for order in orders_to_create:
+            grouped_orders.setdefault(cls._vl_spent_asset(order), []).append(order)
+        for orders in grouped_orders.values():
+            for order in orders:
+                group = next(
+                    (
+                        group
+                        for group in groups
+                        if len(group) < 50
+                        and cls._vl_spent_asset(group[0]) == cls._vl_spent_asset(order)
+                        and order.trading_pair not in {group_order.trading_pair for group_order in group}
+                    ),
+                    None,
+                )
+                if group is None:
+                    groups.append([order])
+                else:
+                    group.append(order)
+        return groups
+
+    @staticmethod
+    def _vl_spent_asset(order: LimitOrder) -> str:
+        return order.quote_currency.upper() if order.is_buy else order.base_currency.upper()
+
+    @classmethod
+    def _assign_vl_order_ids(cls, orders_to_create: List[LimitOrder]) -> List[LimitOrder]:
+        base_uuid_int = int(uuid.uuid4()) & ~0xffff
+        assigned_orders = []
+        used_suffixes = set()
+        for order in orders_to_create:
+            suffix = int(uuid.uuid4()) & 0xffff
+            while suffix in used_suffixes:
+                suffix = int(uuid.uuid4()) & 0xffff
+            used_suffixes.add(suffix)
+            assigned_orders.append(order.copy_with_id(client_order_id=str(uuid.UUID(int=base_uuid_int | suffix))))
+        return assigned_orders
+
+    @staticmethod
+    def _encode_vl_uuid(order_id: str, executor_id: int, leg_id: int) -> str:
+        raw = int(uuid.UUID(order_id))
+        group = raw >> 16
+        return str((executor_id << 252) | (raw << 124) | (group << 12) | leg_id)
+
+    @staticmethod
+    def _order_ids_from_vl_batch_result(order_result: Any) -> List[str]:
+        if isinstance(order_result, list):
+            return [
+                str(order.get("order_id", order))
+                for order in order_result
+                if not isinstance(order, dict) or order.get("order_id") is not None
+            ]
+        if not isinstance(order_result, dict):
+            return []
+        if "order_ids" in order_result:
+            return [str(order_id) for order_id in order_result.get("order_ids") or []]
+        return [
+            str(order.get("order_id"))
+            for order in order_result.get("orders", [])
+            if isinstance(order, dict) and order.get("order_id") is not None
+        ]
+
+    def _validate_previewed_eip712_order(
+            self,
+            preview_payload: Dict[str, Any],
+            preview: Dict[str, Any],
+            market: Dict[str, Any],
+            trade_type: TradeType,
+            amount: Decimal,
+            price: Decimal,
+    ):
+        eip712_order = preview["eip712_order"]
+        normalized_amount = Decimal(str(preview.get("normalized_amount", preview_payload["amount"])))
+        normalized_price = Decimal(str(preview.get("normalized_price", preview_payload["price"])))
+        for field, actual, expected_value in (
+            ("amount", normalized_amount, amount),
+            ("price", normalized_price, price),
+        ):
+            if actual != expected_value:
+                raise ValueError(f"Sera preview normalized {field} {actual} does not match requested {field} {expected_value}.")
+
+        base_raw_amount = self._decimal_to_raw_units(
+            amount=normalized_amount, decimals=int(market["base_decimals"])
+        )
+        quote_amount_field = "fromAmount" if trade_type is TradeType.BUY else "toAmount"
+        self._validate_previewed_quote_raw_amount(
+            actual=eip712_order.get(quote_amount_field),
+            amount=normalized_amount,
+            price=normalized_price,
+            decimals=int(market["quote_decimals"]),
+        )
+        from_token, to_token, from_amount, to_amount = (
+            (market["quote_address"], market["base_address"], eip712_order.get("fromAmount"), base_raw_amount)
+            if trade_type is TradeType.BUY
+            else (market["base_address"], market["quote_address"], base_raw_amount, eip712_order.get("toAmount"))
+        )
+        expected = {
+            "user": preview_payload["owner_address"],
+            "expiration": preview_payload["expiration"],
+            "feeBps": "0",
+            "recipient": CONSTANTS.ZERO_ADDRESS,
+            "fromToken": from_token,
+            "toToken": to_token,
+            "fromAmount": from_amount,
+            "toAmount": to_amount,
+            "initialDepositAmount": "0",
+            "uuid": preview_payload["uuid_int"],
+        }
+        for field, expected_value in expected.items():
+            actual = eip712_order.get(field)
+            if not self._eip712_values_match(actual, expected_value):
+                raise ValueError(
+                    f"Sera previewed EIP-712 order mismatch for {field}: expected {expected_value!r}, got {actual!r}."
+                )
+
+    @staticmethod
+    def _validate_previewed_quote_raw_amount(actual: Any, amount: Decimal, price: Decimal, decimals: int):
+        try:
+            actual_raw_amount = Decimal(str(actual))
+        except Exception as exception:
+            raise ValueError(f"Sera previewed EIP-712 quote amount is invalid: {actual!r}.") from exception
+        if actual_raw_amount <= 0 or actual_raw_amount != actual_raw_amount.to_integral_value():
+            raise ValueError(f"Sera previewed EIP-712 quote amount is invalid: {actual!r}.")
+
+        expected_raw_amount = amount * price * (Decimal("10") ** decimals)
+        if abs(actual_raw_amount - expected_raw_amount) > Decimal("1"):
+            raise ValueError(
+                "Sera previewed EIP-712 quote amount mismatch: "
+                f"expected approximately {expected_raw_amount}, got {actual_raw_amount}."
+            )
+
+    def _eip712_order_message(
+            self,
+            market: Dict[str, Any],
+            trade_type: TradeType,
+            amount: Decimal,
+            price: Decimal,
+            expiration: int,
+            uuid_int: str,
+    ) -> Dict[str, Any]:
+        base_raw_amount = self._decimal_to_raw_units(amount=amount, decimals=int(market["base_decimals"]))
+        # The quote leg (amount * price) of two 6-decimal values can carry up to 12 decimals, which is
+        # never exactly representable at the quote token's precision. Truncate it the same way Sera's backend
+        # does when it reconstructs the order to verify the signature; otherwise the signed fromAmount/toAmount
+        # won't match and the batch is rejected with "Invalid signature". The base leg stays exact: amount is
+        # grid-aligned, so non-representability there is a real bug.
+        quote_raw_amount = self._decimal_to_raw_units_truncated(
+            amount=amount * price, decimals=int(market["quote_decimals"])
+        )
+        from_token, to_token, from_amount, to_amount = (
+            (market["quote_address"], market["base_address"], quote_raw_amount, base_raw_amount)
+            if trade_type is TradeType.BUY
+            else (market["base_address"], market["quote_address"], base_raw_amount, quote_raw_amount)
+        )
+        return {
+            "user": self.wallet_address,
+            "expiration": expiration,
+            "feeBps": "0",
+            "recipient": CONSTANTS.ZERO_ADDRESS,
+            "fromToken": from_token,
+            "toToken": to_token,
+            "fromAmount": from_amount,
+            "toAmount": to_amount,
+            "initialDepositAmount": "0",
+            "uuid": uuid_int,
+        }
+
+    @classmethod
+    def _validate_eip712_domain(cls, eip712_domain: Dict[str, Any]):
+        expected = {
+            "name": CONSTANTS.EIP712_DOMAIN_NAME,
+            "version": CONSTANTS.EIP712_DOMAIN_VERSION,
+            "chainId": CONSTANTS.EIP712_CHAIN_ID,
+            "verifyingContract": CONSTANTS.EIP712_VERIFYING_CONTRACT,
+        }
+        eip712_domain = eip712_domain or {}
+        for field, expected_value in expected.items():
+            actual = eip712_domain.get(field)
+            if not cls._eip712_values_match(actual, expected_value):
+                raise ValueError(
+                    f"Sera EIP-712 domain mismatch for {field}: expected {expected_value!r}, got {actual!r}."
+                )
+
+    async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder):
+        await self._ensure_exchange_config()
+        exchange_order_id = await tracked_order.get_exchange_order_id()
+
+        vl_batch_id = self._vl_batch_id_by_order.get(exchange_order_id) or self._vl_batch_id_by_order.get(order_id)
+        uuid_int = self._order_uuid_ints.get(exchange_order_id) or self._order_uuid_ints.get(order_id)
+
+        # VL orders cannot be cancelled one leg at a time — Sera only supports cancelling the whole batch
+        # (POST /orders/vl/cancel). The batch id is not returned at create time; it is captured from
+        # order-status responses. If we don't have it yet, fetch the order once (also backfills uuid_int).
+        if vl_batch_id is None:
+            order_status = await self._fetch_order_status_safe(exchange_order_id)
+            if order_status.get("vl_batch_id"):
+                vl_batch_id = str(order_status["vl_batch_id"])
+                self._vl_batch_id_by_order[exchange_order_id] = vl_batch_id
+            if order_status.get("uuid_int"):
+                uuid_int = str(order_status["uuid_int"])
+                self._order_uuid_ints[exchange_order_id] = uuid_int
+
+        if vl_batch_id is not None:
+            # One cancel removes every leg of the batch. Skip if we've already cancelled this batch for a
+            # sibling leg this session.
+            if vl_batch_id not in self._cancelled_vl_batch_ids:
+                await self._cancel_vl_batch(vl_batch_id)
+                self._cancelled_vl_batch_ids.add(vl_batch_id)
+                if len(self._cancelled_vl_batch_ids) > 5000:
+                    self._cancelled_vl_batch_ids.clear()
+            return True
+
+        # Regular (non-VL) single-order cancel.
+        if uuid_int is None:
+            raise IOError(f"Cannot cancel order {exchange_order_id}: uuid_int unavailable.")
+        signature = self.authenticator.sign_typed_data(
+            domain=self._eip712_domain,
+            message_types=CONSTANTS.CANCEL_ORDER_TYPES,
+            message={"owner": self.wallet_address, "orderId": int(uuid_int)},
+        )
+        await self._api_post(
+            path_url=CONSTANTS.CANCEL_ORDER_PATH_URL,
+            data={
+                "owner_address": self.wallet_address,
+                "order_id": exchange_order_id,
+                "uuid_int": uuid_int,
+                "signature": signature,
+            },
+            is_auth_required=False,
+            limit_id=CONSTANTS.CANCEL_ORDER_PATH_URL,
+        )
+        return True
+
+    async def _fetch_order_status_safe(self, exchange_order_id: str) -> Dict[str, Any]:
+        try:
+            return await self._api_get(
+                path_url=CONSTANTS.ORDER_PATH_URL.format(order_id=exchange_order_id),
+                is_auth_required=True,
+                limit_id=CONSTANTS.ORDER_PATH_URL,
+            )
+        except IOError:
+            return {}
+
+    async def _cancel_vl_batch(self, vl_batch_id: str):
+        signature = self.authenticator.sign_typed_data(
+            domain=self._eip712_domain,
+            message_types=CONSTANTS.CANCEL_VL_BATCH_TYPES,
+            message={"owner": self.wallet_address, "vlBatchId": vl_batch_id},
+        )
+        await self._api_post(
+            path_url=CONSTANTS.VL_CANCEL_PATH_URL,
+            data={
+                "owner_address": self.wallet_address,
+                "vl_batch_id": vl_batch_id,
+                "signature": signature,
+            },
+            is_auth_required=False,
+            limit_id=CONSTANTS.VL_CANCEL_PATH_URL,
+        )
+
+    async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
+        order_data = await self._request_order_status_data(tracked_order=tracked_order)
+        return self._order_update_from_order_data(tracked_order=tracked_order, order_data=order_data)
+
+    async def _request_order_status_data(self, tracked_order: InFlightOrder) -> Dict[str, Any]:
+        exchange_order_id = await tracked_order.get_exchange_order_id()
+        order_data = await self._api_get(
+            path_url=CONSTANTS.ORDER_PATH_URL.format(order_id=exchange_order_id),
+            is_auth_required=True,
+            limit_id=CONSTANTS.ORDER_PATH_URL,
+        )
+        if order_data.get("uuid_int"):
+            self._order_uuid_ints[exchange_order_id] = str(order_data["uuid_int"])
+        if order_data.get("vl_batch_id"):
+            self._vl_batch_id_by_order[exchange_order_id] = str(order_data["vl_batch_id"])
+        return order_data
+
+    def _order_update_from_order_data(self, tracked_order: InFlightOrder, order_data: Dict[str, Any]) -> OrderUpdate:
+        return OrderUpdate(
+            client_order_id=tracked_order.client_order_id,
+            exchange_order_id=tracked_order.exchange_order_id,
+            trading_pair=tracked_order.trading_pair,
+            update_timestamp=self._timestamp_from_order(order_data),
+            new_state=self._order_state_from_order_data(order_data=order_data),
+        )
+
+    async def _all_trade_updates_for_order(self, order: InFlightOrder) -> List[TradeUpdate]:
+        if order.exchange_order_id is None:
+            return []
+        fills_response = await self._api_get(
+            path_url=CONSTANTS.FILLS_PATH_URL.format(order_id=order.exchange_order_id),
+            params={"limit": 500, "offset": 0},
+            is_auth_required=True,
+            limit_id=CONSTANTS.FILLS_PATH_URL,
+        )
+        trade_updates = []
+        for fill in fills_response.get("items", []):
+            if order.exchange_order_id not in [fill.get("maker_order_id"), fill.get("taker_order_id")]:
+                continue
+            price = Decimal(str(fill["price"]))
+            quantity = Decimal(str(fill["quantity"]))
+            fee = TradeFeeBase.new_spot_fee(
+                fee_schema=self.trade_fee_schema(),
+                trade_type=order.trade_type,
+                flat_fees=self._flat_fees_from_fill(fill=fill),
+            )
+            trade_updates.append(TradeUpdate(
+                trade_id=self._trade_id_from_fill(fill=fill),
+                client_order_id=order.client_order_id,
+                exchange_order_id=order.exchange_order_id,
+                trading_pair=order.trading_pair,
+                fee=fee,
+                fill_base_amount=quantity,
+                fill_quote_amount=quantity * price,
+                fill_price=price,
+                fill_timestamp=self._timestamp_from_fill(fill=fill),
+            ))
+        return trade_updates
+
+    async def _update_balances(self):
+        balances_response = await self._api_get(
+            path_url=CONSTANTS.BALANCES_PATH_URL,
+            params={"owner_address": self.wallet_address},
+            is_auth_required=True,
+            limit_id=CONSTANTS.BALANCES_PATH_URL,
+        )
+        remote_assets = set()
+        for balance in balances_response.get("balances", []):
+            symbol = balance["symbol"].upper()
+            decimals = Decimal(f"1e{int(balance['decimals'])}")
+            total = Decimal(str(balance["total"])) / decimals
+            available = Decimal(str(balance["vault_available"])) / decimals
+            self._account_balances[symbol] = total
+            self._account_available_balances[symbol] = available
+            remote_assets.add(symbol)
+        for asset in set(self._account_balances.keys()) - remote_assets:
+            del self._account_balances[asset]
+            self._account_available_balances.pop(asset, None)
+
+    async def _update_trading_fees(self):
+        return None
+
+    async def _user_stream_event_listener(self):
+        while True:
+            await self._sleep(60.0)
+
+    async def _status_polling_loop_fetch_updates(self):
+        await self._update_balances()
+        last_tick = self._last_poll_timestamp / self.UPDATE_ORDER_STATUS_MIN_INTERVAL
+        current_tick = self.current_timestamp / self.UPDATE_ORDER_STATUS_MIN_INTERVAL
+        if self.in_flight_orders and current_tick > last_tick:
+            await self._update_orders_status_and_new_fills(read_calls_used=1)
+
+    async def _update_orders_status_and_new_fills(self, read_calls_used: int = 0):
+        read_calls_this_second = read_calls_used
+        for tracked_order in list(self.in_flight_orders.values()):
+            try:
+                if read_calls_this_second >= CONSTANTS.READ_REQUESTS_PER_SECOND - 2:
+                    await self._sleep(1.0)
+                    read_calls_this_second = 0
+                order_data = await self._request_order_status_data(tracked_order=tracked_order)
+                read_calls_this_second += 1
+                filled_base_amount = Decimal(str(order_data.get("filled_base_amount") or "0"))
+                if filled_base_amount > tracked_order.executed_amount_base:
+                    if read_calls_this_second >= CONSTANTS.READ_REQUESTS_PER_SECOND - 2:
+                        await self._sleep(1.0)
+                        read_calls_this_second = 0
+                    trade_updates = await self._all_trade_updates_for_order(order=tracked_order)
+                    read_calls_this_second += 1
+                    for trade_update in trade_updates:
+                        self._order_tracker.process_trade_update(trade_update)
+                order_update = self._order_update_from_order_data(
+                    tracked_order=tracked_order,
+                    order_data=order_data,
+                )
+                self._order_tracker.process_order_update(order_update)
+            except asyncio.CancelledError:
+                raise
+            except Exception as request_error:
+                await self._handle_update_error_for_active_order(tracked_order, request_error)
+
+    async def _get_last_traded_price(self, trading_pair: str) -> float:
+        await self._ensure_exchange_config()
+        base, quote = split_hb_trading_pair(trading_pair=trading_pair)
+        params = {"base": base, "quote": quote}
+        token_base = self._token_info_by_symbol.get(base)
+        token_quote = self._token_info_by_symbol.get(quote)
+        if token_base is not None and token_quote is not None:
+            params = {"base": token_base.get("currency", base), "quote": token_quote.get("currency", quote)}
+        rate_response = await self._api_get(
+            path_url=CONSTANTS.FX_RATE_PATH_URL,
+            params=params,
+            is_auth_required=False,
+            limit_id=CONSTANTS.FX_RATE_PATH_URL,
+        )
+        return float(rate_response["rate"])
+
+    async def _ensure_exchange_config(self):
+        if self._executor_id is None:
+            health = await self._api_get(
+                path_url=CONSTANTS.HEALTH_PATH_URL,
+                is_auth_required=False,
+                limit_id=CONSTANTS.HEALTH_PATH_URL,
+            )
+            self._executor_id = int(health["executor_id"])
+        if self._eip712_domain is None:
+            config = await self._api_get(
+                path_url=CONSTANTS.CONFIG_PATH_URL,
+                is_auth_required=False,
+                limit_id=CONSTANTS.CONFIG_PATH_URL,
+            )
+            eip712_domain = config["eip712_domain"]
+            self._validate_eip712_domain(eip712_domain)
+            self._eip712_domain = eip712_domain
+        if len(self._token_info_by_symbol) == 0:
+            tokens = await self._api_get(
+                path_url=CONSTANTS.TOKENS_PATH_URL,
+                is_auth_required=False,
+                limit_id=CONSTANTS.TOKENS_PATH_URL,
+            )
+            self._token_info_by_symbol = {
+                token["symbol"].upper(): token
+                for token in tokens.get("tokens", [])
+            }
+
+    async def _new_expiration_timestamp(self) -> int:
+        time_response = await self._api_get(
+            path_url=CONSTANTS.TIME_PATH_URL,
+            is_auth_required=False,
+            limit_id=CONSTANTS.TIME_PATH_URL,
+        )
+        return int(time_response["timestamp"]) + CONSTANTS.ORDER_EXPIRATION_SECONDS
+
+    @staticmethod
+    def _encode_standalone_uuid(order_id: str, executor_id: int) -> str:
+        raw = int(uuid.UUID(order_id))
+        group = raw >> 16
+        return str((executor_id << 252) | (raw << 124) | (group << 12))
+
+    @staticmethod
+    def _decimal_to_raw_units(amount: Decimal, decimals: int) -> str:
+        raw_amount = amount * (Decimal("10") ** decimals)
+        if raw_amount != raw_amount.to_integral_value():
+            raise ValueError(f"Amount {amount} is not exactly representable with {decimals} decimals.")
+        return str(int(raw_amount))
+
+    @staticmethod
+    def _decimal_to_raw_units_truncated(amount: Decimal, decimals: int) -> str:
+        # Sera's backend truncates (rounds toward zero) the quote raw amount when it reconstructs the
+        # order to verify the EIP-712 signature. The signed amount must match that reconstruction exactly
+        # — any other rounding is off by a unit and the backend rejects with "Invalid signature".
+        raw_amount = (amount * (Decimal("10") ** decimals)).to_integral_value(rounding=ROUND_DOWN)
+        return str(int(raw_amount))
+
+    @staticmethod
+    def _eip712_values_match(actual: Any, expected: Any) -> bool:
+        if isinstance(actual, str) and actual.startswith("0x") and isinstance(expected, str) and expected.startswith("0x"):
+            return actual.lower() == expected.lower()
+        try:
+            return int(actual) == int(expected)
+        except (TypeError, ValueError):
+            return str(actual) == str(expected)
+
+    @staticmethod
+    def _trading_pair_from_market(market: Dict[str, Any]) -> str:
+        return combine_to_hb_trading_pair(base=market["base_symbol"].upper(), quote=market["quote_symbol"].upper())
+
+    @staticmethod
+    def _timestamp_from_order(order_data: Dict[str, Any]) -> float:
+        timestamp = order_data.get("updated_at") or order_data.get("created_at")
+        return dp.parse(timestamp).timestamp() if timestamp else time.time()
+
+    @staticmethod
+    def _timestamp_from_fill(fill: Dict[str, Any]) -> float:
+        timestamp = fill.get("timestamp")
+        return dp.parse(timestamp).timestamp() if isinstance(timestamp, str) else float(timestamp or time.time())
+
+    @staticmethod
+    def _trade_id_from_fill(fill: Dict[str, Any]) -> str:
+        return str(fill.get("tx_hash") or (
+            f"{fill.get('maker_order_id')}-{fill.get('taker_order_id')}-"
+            f"{fill.get('timestamp')}-{fill.get('quantity')}-{fill.get('price')}"
+        ))
+
+    @staticmethod
+    def _flat_fees_from_fill(fill: Dict[str, Any]) -> List[TokenAmount]:
+        fees = []
+        economics = fill.get("settlement_economics") or {}
+        for fee in economics.get("fees_paid") or []:
+            token = fee.get("token")
+            amount = fee.get("amount")
+            if token is not None and amount is not None:
+                fees.append(TokenAmount(token=token.upper(), amount=Decimal(str(amount))))
+        return fees
+
+    @staticmethod
+    def _order_state_from_order_data(order_data: Dict[str, Any]) -> OrderState:
+        status = order_data["status"]
+        state = CONSTANTS.ORDER_STATE.get(status, OrderState.FAILED)
+        if state is OrderState.OPEN and Decimal(str(order_data.get("filled_base_amount") or "0")) > Decimal("0"):
+            state = OrderState.PARTIALLY_FILLED
+        return state

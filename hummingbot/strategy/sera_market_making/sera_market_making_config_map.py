@@ -15,7 +15,7 @@ from hummingbot.client.settings import AllConnectorSettings, required_exchanges
 
 
 def maker_trading_pair_prompt():
-    exchange = pure_market_making_config_map.get("exchange").value
+    exchange = sera_market_making_config_map.get("exchange").value
     example = AllConnectorSettings.get_example_pairs().get(exchange)
     return "Enter the token trading pair you would like to trade on %s%s >>> " \
            % (exchange, f" (e.g. {example})" if example else "")
@@ -23,12 +23,12 @@ def maker_trading_pair_prompt():
 
 # strategy specific validators
 def validate_exchange_trading_pair(value: str) -> Optional[str]:
-    exchange = pure_market_making_config_map.get("exchange").value
+    exchange = sera_market_making_config_map.get("exchange").value
     return validate_market_trading_pair(exchange, value)
 
 
 def order_amount_prompt() -> str:
-    trading_pair = pure_market_making_config_map["market"].value
+    trading_pair = sera_market_making_config_map["market"].value
     base_asset, quote_asset = trading_pair.split("-")
     return f"What is the amount of {base_asset} per order? >>> "
 
@@ -40,33 +40,33 @@ def validate_price_source(value: str) -> Optional[str]:
 
 def on_validate_price_source(value: str):
     if value != "external_market":
-        pure_market_making_config_map["price_source_exchange"].value = None
-        pure_market_making_config_map["price_source_market"].value = None
-        pure_market_making_config_map["take_if_crossed"].value = None
+        sera_market_making_config_map["price_source_exchange"].value = None
+        sera_market_making_config_map["price_source_market"].value = None
+        sera_market_making_config_map["take_if_crossed"].value = None
     if value != "custom_api":
-        pure_market_making_config_map["price_source_custom_api"].value = None
+        sera_market_making_config_map["price_source_custom_api"].value = None
     else:
-        pure_market_making_config_map["price_type"].value = "custom"
+        sera_market_making_config_map["price_type"].value = "custom"
 
 
 def price_source_market_prompt() -> str:
-    external_market = pure_market_making_config_map.get("price_source_exchange").value
+    external_market = sera_market_making_config_map.get("price_source_exchange").value
     return f'Enter the token trading pair on {external_market} >>> '
 
 
 def validate_price_source_exchange(value: str) -> Optional[str]:
-    if value == pure_market_making_config_map.get("exchange").value:
+    if value == sera_market_making_config_map.get("exchange").value:
         return "Price source exchange cannot be the same as maker exchange."
     return validate_connector(value)
 
 
 def on_validated_price_source_exchange(value: str):
     if value is None:
-        pure_market_making_config_map["price_source_market"].value = None
+        sera_market_making_config_map["price_source_market"].value = None
 
 
 def validate_price_source_market(value: str) -> Optional[str]:
-    market = pure_market_making_config_map.get("price_source_exchange").value
+    market = sera_market_making_config_map.get("price_source_exchange").value
     return validate_market_trading_pair(market, value)
 
 
@@ -81,7 +81,7 @@ def validate_price_floor_ceiling(value: str) -> Optional[str]:
 
 def validate_price_type(value: str) -> Optional[str]:
     error = None
-    price_source = pure_market_making_config_map.get("price_source").value
+    price_source = sera_market_making_config_map.get("price_source").value
     if price_source != "custom_api":
         valid_values = {"mid_price",
                         "last_price",
@@ -99,7 +99,7 @@ def validate_price_type(value: str) -> Optional[str]:
 
 def on_validated_price_type(value: str):
     if value == 'inventory_cost':
-        pure_market_making_config_map["inventory_price"].value = None
+        sera_market_making_config_map["inventory_price"].value = None
 
 
 def validate_vl_order_markets(value: str) -> Optional[str]:
@@ -137,11 +137,11 @@ def validate_decimal_list(
             return validate_result
 
 
-pure_market_making_config_map = {
+sera_market_making_config_map = {
     "strategy":
         ConfigVar(key="strategy",
                   prompt=None,
-                  default="pure_market_making"),
+                  default="sera_market_making"),
     "exchange":
         ConfigVar(key="exchange",
                   prompt="Enter your maker spot connector >>> ",
@@ -226,21 +226,21 @@ pure_market_making_config_map = {
                   prompt="Enter a percentage to the current price that sets the price ceiling. Above this price, only sell orders will be placed >>> ",
                   type_str="decimal",
                   default=Decimal("1"),
-                  required_if=lambda: pure_market_making_config_map.get("moving_price_band_enabled").value,
+                  required_if=lambda: sera_market_making_config_map.get("moving_price_band_enabled").value,
                   validator=validate_decimal),
     "price_floor_pct":
         ConfigVar(key="price_floor_pct",
                   prompt="Enter a percentage to the current price that sets the price floor. Below this price, only buy orders will be placed >>> ",
                   type_str="decimal",
                   default=Decimal("-1"),
-                  required_if=lambda: pure_market_making_config_map.get("moving_price_band_enabled").value,
+                  required_if=lambda: sera_market_making_config_map.get("moving_price_band_enabled").value,
                   validator=validate_decimal),
     "price_band_refresh_time":
         ConfigVar(key="price_band_refresh_time",
                   prompt="After this amount of time (in seconds), the price bands are reset based on the current price >>> ",
                   type_str="float",
                   default=86400,
-                  required_if=lambda: pure_market_making_config_map.get("moving_price_band_enabled").value,
+                  required_if=lambda: sera_market_making_config_map.get("moving_price_band_enabled").value,
                   validator=validate_decimal),
     "ping_pong_enabled":
         ConfigVar(key="ping_pong_enabled",
@@ -259,7 +259,7 @@ pure_market_making_config_map = {
         ConfigVar(key="order_level_amount",
                   prompt="How much do you want to increase or decrease the order size for each "
                          "additional order? (decrease < 0 > increase) >>> ",
-                  required_if=lambda: pure_market_making_config_map.get("order_levels").value > 1,
+                  required_if=lambda: sera_market_making_config_map.get("order_levels").value > 1,
                   type_str="decimal",
                   validator=lambda v: validate_decimal(v),
                   default=0),
@@ -267,7 +267,7 @@ pure_market_making_config_map = {
         ConfigVar(key="order_level_spread",
                   prompt="Enter the price increments (as percentage) for subsequent "
                          "orders? (Enter 1 to indicate 1%) >>> ",
-                  required_if=lambda: pure_market_making_config_map.get("order_levels").value > 1,
+                  required_if=lambda: sera_market_making_config_map.get("order_levels").value > 1,
                   type_str="decimal",
                   validator=lambda v: validate_decimal(v, 0, 100, inclusive=False),
                   default=Decimal("1")),
@@ -280,7 +280,7 @@ pure_market_making_config_map = {
     "inventory_target_base_pct":
         ConfigVar(key="inventory_target_base_pct",
                   prompt="What is your target base asset percentage? Enter 50 for 50% >>> ",
-                  required_if=lambda: pure_market_making_config_map.get("inventory_skew_enabled").value,
+                  required_if=lambda: sera_market_making_config_map.get("inventory_skew_enabled").value,
                   type_str="decimal",
                   validator=lambda v: validate_decimal(v, 0, 100),
                   default=Decimal("50")),
@@ -288,7 +288,7 @@ pure_market_making_config_map = {
         ConfigVar(key="inventory_range_multiplier",
                   prompt="What is your tolerable range of inventory around the target, "
                          "expressed in multiples of your total order size? ",
-                  required_if=lambda: pure_market_making_config_map.get("inventory_skew_enabled").value,
+                  required_if=lambda: sera_market_making_config_map.get("inventory_skew_enabled").value,
                   type_str="decimal",
                   validator=lambda v: validate_decimal(v, min_value=0, inclusive=False),
                   default=Decimal("1")),
@@ -297,7 +297,7 @@ pure_market_making_config_map = {
                   prompt="What is the price of your base asset inventory? ",
                   type_str="decimal",
                   validator=lambda v: validate_decimal(v, min_value=Decimal("0"), inclusive=True),
-                  required_if=lambda: pure_market_making_config_map.get("price_type").value == "inventory_cost",
+                  required_if=lambda: sera_market_making_config_map.get("price_type").value == "inventory_cost",
                   default=Decimal("1"),
                   ),
     "filled_order_delay":
@@ -317,7 +317,7 @@ pure_market_making_config_map = {
         ConfigVar(key="hanging_orders_cancel_pct",
                   prompt="At what spread percentage (from mid price) will hanging orders be canceled? "
                          "(Enter 1 to indicate 1%) >>> ",
-                  required_if=lambda: pure_market_making_config_map.get("hanging_orders_enabled").value,
+                  required_if=lambda: sera_market_making_config_map.get("hanging_orders_enabled").value,
                   type_str="decimal",
                   default=Decimal("10"),
                   validator=lambda v: validate_decimal(v, 0, 100, inclusive=False)),
@@ -332,7 +332,7 @@ pure_market_making_config_map = {
                   prompt="How deep do you want to go into the order book for calculating "
                          "the top ask, ignoring dust orders on the top "
                          "(expressed in base asset amount)? >>> ",
-                  required_if=lambda: pure_market_making_config_map.get("order_optimization_enabled").value,
+                  required_if=lambda: sera_market_making_config_map.get("order_optimization_enabled").value,
                   type_str="decimal",
                   validator=lambda v: validate_decimal(v, min_value=0),
                   default=0),
@@ -341,7 +341,7 @@ pure_market_making_config_map = {
                   prompt="How deep do you want to go into the order book for calculating "
                          "the top bid, ignoring dust orders on the top "
                          "(expressed in base asset amount)? >>> ",
-                  required_if=lambda: pure_market_making_config_map.get("order_optimization_enabled").value,
+                  required_if=lambda: sera_market_making_config_map.get("order_optimization_enabled").value,
                   type_str="decimal",
                   validator=lambda v: validate_decimal(v, min_value=0),
                   default=0),
@@ -363,34 +363,34 @@ pure_market_making_config_map = {
                   prompt="Which price type to use? ("
                          "mid_price/last_price/last_own_trade_price/best_bid/best_ask/inventory_cost) >>> ",
                   type_str="str",
-                  required_if=lambda: pure_market_making_config_map.get("price_source").value != "custom_api",
+                  required_if=lambda: sera_market_making_config_map.get("price_source").value != "custom_api",
                   default="mid_price",
                   on_validated=on_validated_price_type,
                   validator=validate_price_type),
     "price_source_exchange":
         ConfigVar(key="price_source_exchange",
                   prompt="Enter external price source exchange name >>> ",
-                  required_if=lambda: pure_market_making_config_map.get("price_source").value == "external_market",
+                  required_if=lambda: sera_market_making_config_map.get("price_source").value == "external_market",
                   type_str="str",
                   validator=validate_price_source_exchange,
                   on_validated=on_validated_price_source_exchange),
     "price_source_market":
         ConfigVar(key="price_source_market",
                   prompt=price_source_market_prompt,
-                  required_if=lambda: pure_market_making_config_map.get("price_source").value == "external_market",
+                  required_if=lambda: sera_market_making_config_map.get("price_source").value == "external_market",
                   type_str="str",
                   validator=validate_price_source_market),
     "take_if_crossed":
         ConfigVar(key="take_if_crossed",
                   prompt="Do you want to take the best order if orders cross the orderbook? ((Yes/No) >>> ",
-                  required_if=lambda: pure_market_making_config_map.get(
+                  required_if=lambda: sera_market_making_config_map.get(
                       "price_source").value == "external_market",
                   type_str="bool",
                   validator=validate_bool),
     "price_source_custom_api":
         ConfigVar(key="price_source_custom_api",
                   prompt="Enter pricing API URL >>> ",
-                  required_if=lambda: pure_market_making_config_map.get("price_source").value == "custom_api",
+                  required_if=lambda: sera_market_making_config_map.get("price_source").value == "custom_api",
                   type_str="str"),
     "custom_api_update_interval":
         ConfigVar(key="custom_api_update_interval",
@@ -432,7 +432,7 @@ pure_market_making_config_map = {
                   prompt="Enter the Sera trading pairs to include in VL batches "
                          "(e.g. XSGD-MYRT,XSGD-SGD) >>> ",
                   default=None,
-                  required_if=lambda: pure_market_making_config_map.get("use_vl_orders").value,
+                  required_if=lambda: sera_market_making_config_map.get("use_vl_orders").value,
                   type_str="str",
                   validator=validate_vl_order_markets),
     "vl_triangular_enabled":
@@ -440,7 +440,7 @@ pure_market_making_config_map = {
                   prompt="Do you want to enable the mixed/triangular VL model so any sibling sharing the "
                          "base or quote asset (in either role) is mirrored on the same side? (Yes/No) >>> ",
                   default=False,
-                  required_if=lambda: pure_market_making_config_map.get("use_vl_orders").value,
+                  required_if=lambda: sera_market_making_config_map.get("use_vl_orders").value,
                   type_str="bool",
                   validator=validate_bool),
     "bid_order_level_spreads":
@@ -451,7 +451,7 @@ pure_market_making_config_map = {
                          "minimum length of bid_order_level_spreads and bid_order_level_amounts >>> ",
                   default=None,
                   type_str="str",
-                  required_if=lambda: pure_market_making_config_map.get(
+                  required_if=lambda: sera_market_making_config_map.get(
                       "split_order_levels_enabled").value,
                   validator=lambda v: validate_decimal_list(v)),
     "ask_order_level_spreads":
@@ -462,7 +462,7 @@ pure_market_making_config_map = {
                          "minimum length of bid_order_level_spreads and bid_order_level_amounts >>> ",
                   default=None,
                   type_str="str",
-                  required_if=lambda: pure_market_making_config_map.get(
+                  required_if=lambda: sera_market_making_config_map.get(
                       "split_order_levels_enabled").value,
                   validator=lambda v: validate_decimal_list(v)),
     "bid_order_level_amounts":
@@ -473,7 +473,7 @@ pure_market_making_config_map = {
                          "minimum length of bid_order_level_spreads and bid_order_level_amounts >>> ",
                   default=None,
                   type_str="str",
-                  required_if=lambda: pure_market_making_config_map.get(
+                  required_if=lambda: sera_market_making_config_map.get(
                       "split_order_levels_enabled").value,
                   validator=lambda v: validate_decimal_list(v, min_value=Decimal("0"), max_value=None)),
     "ask_order_level_amounts":
@@ -483,7 +483,7 @@ pure_market_making_config_map = {
                          "The number of levels set will be equal to the "
                          "minimum length of bid_order_level_spreads and bid_order_level_amounts >>> ",
                   default=None,
-                  required_if=lambda: pure_market_making_config_map.get(
+                  required_if=lambda: sera_market_making_config_map.get(
                       "split_order_levels_enabled").value,
                   type_str="str",
                   validator=lambda v: validate_decimal_list(v, min_value=Decimal("0"), max_value=None)),

@@ -6,9 +6,9 @@ from hummingbot.connector.exchange_base import ExchangeBase
 from hummingbot.strategy.api_asset_price_delegate import APIAssetPriceDelegate
 from hummingbot.strategy.market_trading_pair_tuple import MarketTradingPairTuple
 from hummingbot.strategy.order_book_asset_price_delegate import OrderBookAssetPriceDelegate
-from hummingbot.strategy.pure_market_making import InventoryCostPriceDelegate, PureMarketMakingStrategy
-from hummingbot.strategy.pure_market_making.moving_price_band import MovingPriceBand
-from hummingbot.strategy.pure_market_making.pure_market_making_config_map import pure_market_making_config_map as c_map
+from hummingbot.strategy.sera_market_making import InventoryCostPriceDelegate, SeraMarketMakingStrategy
+from hummingbot.strategy.sera_market_making.moving_price_band import MovingPriceBand
+from hummingbot.strategy.sera_market_making.sera_market_making_config_map import sera_market_making_config_map as c_map
 
 
 async def start(self):
@@ -119,8 +119,8 @@ async def start(self):
 
         should_wait_order_cancel_confirmation = c_map.get("should_wait_order_cancel_confirmation")
 
-        strategy_logging_options = PureMarketMakingStrategy.OPTION_LOG_ALL
-        self.strategy = PureMarketMakingStrategy()
+        strategy_logging_options = SeraMarketMakingStrategy.OPTION_LOG_ALL
+        self.strategy = SeraMarketMakingStrategy()
         self.strategy.init_params(
             market_info=MarketTradingPairTuple(*maker_data),
             bid_spread=bid_spread,
