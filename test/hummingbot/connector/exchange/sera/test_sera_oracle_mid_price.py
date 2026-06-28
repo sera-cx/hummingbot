@@ -56,11 +56,3 @@ class SeraOracleMidPriceTest(unittest.TestCase):
             Decimal("1.10"),
             self.exchange.get_price_by_type(self.trading_pair, PriceType.MidPrice),
         )
-
-    def test_set_mid_price_from_price_oracle_sets_manual_mid_price(self):
-        RateOracle.get_instance().set_price(self.trading_pair, Decimal("1.0875"))
-
-        self.assertEqual(Decimal("1.0875"), self.exchange.set_mid_price_from_price_oracle(self.trading_pair))
-
-        RateOracle.get_instance().set_price(self.trading_pair, Decimal("1.1000"))
-        self.assertEqual(Decimal("1.0875"), self.exchange.get_mid_price(self.trading_pair))

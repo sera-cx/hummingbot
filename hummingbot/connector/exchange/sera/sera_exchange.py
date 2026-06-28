@@ -142,12 +142,6 @@ class SeraExchange(ExchangePyBase):
         else:
             self._manual_mid_price[trading_pair] = Decimal(str(price))
 
-    def set_mid_price_from_price_oracle(self, trading_pair: str) -> Optional[Decimal]:
-        oracle_price = self._get_oracle_mid_price(trading_pair)
-        if oracle_price is not None:
-            self.set_manual_mid_price(trading_pair, oracle_price)
-        return oracle_price
-
     def get_mid_price(self, trading_pair: str) -> Decimal:
         if trading_pair in self._manual_mid_price:
             return self._manual_mid_price[trading_pair]
