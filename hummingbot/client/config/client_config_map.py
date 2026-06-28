@@ -867,7 +867,14 @@ class ClientConfigMap(BaseClientModel):
         json_schema_extra={"prompt": lambda cm: f"Select the desired metrics mode ({'/'.join(list(METRICS_MODES.keys()))})"},
     )
     rate_oracle_source: Union[tuple(RATE_SOURCE_MODES.values())] = Field(
-        default=GateIoRateSourceMode(),
+        # Sera trades synthetic FX pairs (e.g. XSGD-MYRT) that exchange oracles do not list, so default
+        # to the Wise oracle pre-populated with the Sera testnet pairs + their ISO-4217 currency map. A
+        # freshly generated conf_client.yml therefore resolves these mids out of the box instead of
+        # silently falling back to an exchange source that has no such pair (see SERA_TESTNET_BUILD_AND_TEST.md).
+        default=WiseRateSourceMode(
+            trading_pairs="XSGD-MYRT,XSGD-USDT,XSGD-JPYC,MYRT-JPYC,XSGD-EGBP,EGBP-MYRT",
+            currency_map="XSGD:SGD,MYRT:MYR,JPYC:JPY,EGBP:GBP",
+        ),
         description=f"A source for rate oracle, currently {', '.join(RATE_SOURCE_MODES.keys())}",
         json_schema_extra={"prompt": lambda cm: f"Select the desired rate oracle source ({'/'.join(RATE_SOURCE_MODES.keys())})"},
     )

@@ -430,6 +430,14 @@ class SeraExchangeTests(unittest.TestCase):
         self.exchange._order_uuid_ints[self.order_id] = uuid_int
         cancel_url = web_utils.public_rest_url(CONSTANTS.CANCEL_ORDER_PATH_URL)
         order_status_url = web_utils.private_rest_url(CONSTANTS.ORDER_PATH_URL.format(order_id=self.order_id))
+        # When the order's vl_batch_id is unknown, _place_cancel does a one-time order-status lookup to
+        # detect whether the order belongs to a VL batch (cancelled whole-batch) before falling back to the
+        # regular single-order cancel. A non-VL response (no vl_batch_id) routes to the regular cancel.
+        mock_api.get(order_status_url, body=json.dumps({
+            "trade_id": self.order_id,
+            "status": "open",
+            "uuid_int": uuid_int,
+        }))
         mock_api.post(cancel_url, body=json.dumps({"status": "ok"}))
 
         cancelled = self.async_run_with_timeout(self.exchange._place_cancel(
@@ -438,7 +446,7 @@ class SeraExchangeTests(unittest.TestCase):
         ))
 
         self.assertTrue(cancelled)
-        self.assertEqual(0, len(self._all_executed_requests(mock_api, order_status_url)))
+        self.assertEqual(1, len(self._all_executed_requests(mock_api, order_status_url)))
         cancel_request = self._all_executed_requests(mock_api, cancel_url)[0]
         self.assertEqual({
             "owner_address": self.wallet_address.lower(),

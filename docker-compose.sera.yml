@@ -1,0 +1,59 @@
+# Option A — run the V1 `sera_market_making` strategy HEADLESS in Docker.
+#
+# This launches the amd64 Sera image and auto-starts the VL strategy from your
+# existing conf/strategies/conf_serapmm_sera.yml. No Condor / Hummingbot API and
+# no V2 controller involved — the full VL / triangular logic runs as-is.
+#
+# The default image CMD runs bin/hummingbot_quickstart.py, which reads these env
+# vars (quickstart.py:256-266):
+#   CONFIG_FILE_NAME -> --config-file-name   (strategy config to load & start)
+#   CONFIG_PASSWORD  -> --config-password    (decrypts conf/connectors/sera.yml)
+#   HEADLESS_MODE    -> --headless           (no CLI; auto-enables MQTT)
+#
+# Prerequisites on the host:
+#   - conf/strategies/conf_serapmm_sera.yml present (it is)
+#   - conf/connectors/sera.yml present, encrypted with CONFIG_PASSWORD (it is)
+#   - the amd64 image built/pulled as hummingbot/hummingbot:sera-amd64
+#
+# Run:
+#   CONFIG_PASSWORD=yourpass docker compose -f docker-compose.sera.yml up -d
+#   docker compose -f docker-compose.sera.yml logs -f
+#
+# Stop:
+#   docker compose -f docker-compose.sera.yml down
+services:
+  hummingbot-sera:
+    container_name: hummingbot-sera
+    image: hummingbot/hummingbot:sera-amd64
+    # To build locally instead of using a prebuilt image, uncomment build and
+    # comment image. On Apple Silicon, prefer the buildx amd64 image (section 12).
+    # build:
+    #   context: .
+    #   dockerfile: Dockerfile
+    volumes:
+      - ./conf:/home/hummingbot/conf
+      - ./conf/connectors:/home/hummingbot/conf/connectors
+      - ./conf/strategies:/home/hummingbot/conf/strategies
+      - ./conf/controllers:/home/hummingbot/conf/controllers
+      - ./conf/scripts:/home/hummingbot/conf/scripts
+      - ./logs:/home/hummingbot/logs
+      - ./data:/home/hummingbot/data
+      - ./certs:/home/hummingbot/certs
+      - ./scripts:/home/hummingbot/scripts
+      - ./controllers:/home/hummingbot/controllers
+    environment:
+      # CONFIG_PASSWORD is taken from the host env (do NOT hardcode secrets here).
+      - CONFIG_PASSWORD=${CONFIG_PASSWORD}
+      - CONFIG_FILE_NAME=conf_serapmm_sera.yml
+      - HEADLESS_MODE=true
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+    tty: true
+    stdin_open: true
+    # Host networking so the MQTT bridge can reach a broker on localhost:1883
+    # (see section 8). MQTT is for remote control/monitoring; trading runs without
+    # it, though headless mode will log connection errors if no broker is present.
+    network_mode: host
